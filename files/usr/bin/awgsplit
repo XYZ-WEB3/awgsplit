@@ -1,0 +1,1321 @@
+#!/bin/sh
+# awgsplit — раздельная маршрутизация через AmneziaWG на OpenWrt.
+#
+#   dnsmasq (nftset=) -> nft-сеты -> ct mark (решение на новое соединение)
+#   -> meta mark -> ip rule fwmark -> своя таблица -> интерфейс туннеля
+#
+# Таблица "inet awgsplit" отдельная от fw4. Сеты с IP из DNS переживают
+# применение настроек; таблица целиком удаляется только командой stop.
+
+. /lib/functions.sh
+
+NAME=awgsplit
+CONF=awgsplit
+T=awgsplit
+BIN=/usr/bin/awgsplit
+LISTS_DIR=/usr/share/awgsplit/lists
+STATE_DIR=/var/run/awgsplit
+LOCKDIR=/var/lock/awgsplit.lck
+FETCHLOCK=/var/lock/awgsplit-fetch.lck
+UPSTREAM=https://raw.githubusercontent.com/itdoginfo/allow-domains/main
+SUPPRESS_PRIO=90
+LOG_LEVEL=info
+QUIET=0
+LOCKED=0
+FLOCKED=0
+
+# ------------------------------------------------------------------ утилиты
+
+log() {
+	local lvl="$1"; shift
+	case "$LOG_LEVEL" in
+		error) [ "$lvl" = error ] || return 0 ;;
+		debug) ;;
+		*)     [ "$lvl" = debug ] && return 0 ;;
+	esac
+	logger -t "$NAME" -p "daemon.$lvl" "$*"
+	if [ -t 2 ] || [ -n "$AWGSPLIT_VERBOSE" ]; then echo "[$lvl] $*" >&2; fi
+	return 0
+}
+
+cfg_err() {
+	[ "$QUIET" = 1 ] || log error "$*"
+	CFG_ERRORS="${CFG_ERRORS}$*
+"
+}
+
+num() { case "$1" in ''|*[!0-9]*) echo "${2:-0}" ;; *) echo "$1" ;; esac; }
+
+nlines() { if [ -f "$1" ]; then awk 'END { print NR }' "$1"; else echo 0; fi; }
+
+# имя секции туннеля: с буквы, латиница/цифры/_, до 24 символов (идёт в имена nft-сетов)
+valid_name() {
+	case "$1" in ''|[!A-Za-z]*|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ ${#1} -le 24 ]
+}
+
+# имя интерфейса OpenWrt = имя устройства AmneziaWG, ядро ограничивает 15 символами
+valid_ifname() {
+	case "$1" in ''|[!A-Za-z]*|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ ${#1} -le 15 ]
+}
+
+valid_mark() {
+	case "$1" in
+		0x*|0X*)
+			local h="${1#0[xX]}"
+			case "$h" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+			[ ${#h} -le 8 ] || return 1 ;;
+		''|0*|*[!0-9]*) return 1 ;;
+		*) [ ${#1} -le 10 ] || return 1 ;;
+	esac
+	[ $(( $1 )) -gt 0 ] && [ $(( $1 )) -le 4294967295 ]
+}
+
+# 253/254/255 = default/main/local — их трогать нельзя (flush 254 = потеря доступа)
+valid_table() {
+	case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+	[ ${#1} -le 3 ] && [ "$1" -ge 1 ] && [ "$1" -le 252 ]
+}
+
+valid_prio() {
+	case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+	[ ${#1} -le 5 ] && [ "$1" -gt "$SUPPRESS_PRIO" ] && [ "$1" -le 32765 ]
+}
+
+valid_ip4() {
+	echo "$1" | awk -F. 'NF != 4 { exit 1 } { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || length($i) > 3 || $i + 0 > 255) exit 1 }'
+}
+
+valid_cidr4() {
+	local ip="${1%/*}" m=32
+	[ "$ip" != "$1" ] && m="${1#*/}"
+	valid_ip4 "$ip" || return 1
+	case "$m" in ''|*[!0-9]*) return 1 ;; esac
+	[ ${#m} -le 2 ] && [ "$m" -le 32 ]
+}
+
+hexmark() { printf '0x%x' $(( $1 )); }
+
+# верхняя граница значения вида "120" или "100-120"
+range_max() { num "${1##*-}" "${2:-0}"; }
+
+# ------------------------------------------------------------------ блокировки
+
+_lock() { # dir wait_seconds
+	local d="$1" w="$2" i=0 e=0 pid
+	mkdir -p "${d%/*}"
+	while ! mkdir "$d" 2>/dev/null; do
+		pid=$(cat "$d/pid" 2>/dev/null)
+		if [ -n "$pid" ]; then
+			kill -0 "$pid" 2>/dev/null || { rm -rf "$d"; continue; }
+		else
+			e=$((e + 1)); [ "$e" -gt 10 ] && { rm -rf "$d"; continue; }
+		fi
+		[ "$i" -ge "$w" ] && return 1
+		i=$((i + 1)); sleep 1
+	done
+	echo $$ > "$d/pid"
+}
+
+lock_acquire() { _lock "$LOCKDIR" "${1:-60}" || return 1; LOCKED=1; }
+lock_release() { [ "$LOCKED" = 1 ] && rm -rf "$LOCKDIR"; LOCKED=0; }
+
+trap 'lock_release; [ "$FLOCKED" = 1 ] && rm -rf "$FETCHLOCK"' EXIT
+trap 'exit 1' HUP INT TERM
+
+# ------------------------------------------------------------------ списки
+
+# домены (itdoginfo/allow-domains): plain-text, по одному на строку
+list_url() {
+	case "$1" in
+		russia_inside)  echo "$UPSTREAM/Russia/inside-raw.lst" ;;
+		russia_outside) echo "$UPSTREAM/Russia/outside-raw.lst" ;;
+		telegram|meta|twitter|discord|cloudflare|cloudfront|youtube|google_ai|google_meet|google_play|tiktok|hdrezka|roblox|digitalocean|hetzner|ovh)
+		                echo "$UPSTREAM/Services/$1.lst" ;;
+		anime|block|geoblock|hodca|news|porn)
+		                echo "$UPSTREAM/Categories/$1.lst" ;;
+		*)              echo "" ;;
+	esac
+}
+
+# IPv4-подсети сервисов (Telegram и др. ходят по IP без DNS)
+list_net4_url() {
+	case "$1" in
+		telegram|meta|twitter|discord|cloudflare|cloudfront|roblox|digitalocean|hetzner|ovh|google_meet)
+		       echo "$UPSTREAM/Subnets/IPv4/$1.lst" ;;
+		*)     echo "" ;;
+	esac
+}
+
+# ------------------------------------------------------------------ конфиг
+
+load_global() {
+	config_get_bool ENABLED     global enabled 1
+	config_get      UPDATE_INT  global update_interval 72
+	config_get_bool HEALTHCHECK global healthcheck 1
+	config_get      LOG_LEVEL   global log_level info
+	config_get      LAN_IFACES  global lan_ifaces 'br-lan'
+	config_get_bool BLOCK_DOH   global block_doh_canary 1
+	config_get      DNSDIR_OVR  global dnsmasq_dir ''
+	UPDATE_INT=$(num "$UPDATE_INT" 72)
+	[ "$UPDATE_INT" -ge 1 ] || UPDATE_INT=72
+}
+
+tunnel_cb() {
+	local s="$1" en iface mark table prio m
+	config_get_bool en "$s" enabled 1
+	[ "$en" = 1 ] || return 0
+	valid_name "$s" || { cfg_err "туннель '$s': имя должно начинаться с буквы, только A-Z a-z 0-9 _ (до 24 символов)"; return 0; }
+	config_get iface "$s" interface ''
+	config_get mark  "$s" fwmark ''
+	config_get table "$s" table ''
+	config_get prio  "$s" priority ''
+	[ -n "$iface" ] || { cfg_err "туннель '$s': не выбран сетевой интерфейс"; return 0; }
+	valid_ifname "$iface" || { cfg_err "туннель '$s': недопустимое имя интерфейса '$iface'"; return 0; }
+	valid_mark "$mark"   || { cfg_err "туннель '$s': неверная метка '$mark' (нужно 0x1..0xffffffff)"; return 0; }
+	valid_table "$table" || { cfg_err "туннель '$s': неверная таблица '$table' (нужно 1..252)"; return 0; }
+	valid_prio "$prio"   || { cfg_err "туннель '$s': неверный приоритет '$prio' (нужно $((SUPPRESS_PRIO + 1))..32765)"; return 0; }
+	m=$(hexmark "$mark")
+	case "$USED" in *" m$m "*) cfg_err "туннель '$s': метка $m уже занята другим туннелем"; return 0 ;; esac
+	case "$USED" in *" t$table "*) cfg_err "туннель '$s': таблица $table уже занята другим туннелем"; return 0 ;; esac
+	case "$USED" in *" i$iface "*) cfg_err "туннель '$s': интерфейс $iface уже используется другим туннелем"; return 0 ;; esac
+	USED="$USED m$m t$table i$iface "
+	TUNNELS="$TUNNELS $(printf '%05d' "$prio"):$s"
+}
+
+# Туннели, прошедшие проверку, в порядке приоритета (меньше = главнее)
+collect_tunnels() {
+	TUNNELS=""; USED=" "; CFG_ERRORS=""
+	config_foreach tunnel_cb tunnel
+	TUNNELS=$(for x in $TUNNELS; do echo "$x"; done | sort | sed 's/^[0-9]*://' | tr '\n' ' ')
+}
+
+tunnel_listed() { [ -n "$1" ] && case " $TUNNELS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+tunnel_dev() { local d; d=$(uci -q get network."$1".device); echo "${d:-$1}"; }
+
+# Заполняет TIF TDEV TMARK TTABLE TPRIO TFB TLABEL для туннеля $1
+tget() {
+	config_get TIF    "$1" interface ''
+	config_get TMARK  "$1" fwmark ''
+	config_get TTABLE "$1" table ''
+	config_get TPRIO  "$1" priority ''
+	config_get TFB    "$1" fallback ''
+	config_get TLABEL "$1" label "$1"
+	TMARK=$(hexmark "$TMARK")
+	TDEV=$(tunnel_dev "$TIF")
+	[ "$TFB" = "$1" ] && TFB=""
+	tunnel_listed "$TFB" || TFB=""
+}
+
+# DNS внутри туннеля: awgsplit.<t>.dns, иначе network.<iface>.awgsplit_dns (пишет импорт)
+tunnel_dns() { # tunnel iface
+	local list d
+	config_get list "$1" dns ''
+	[ -n "$list" ] || list=$(uci -q get network."$2".awgsplit_dns)
+	for d in $list; do valid_ip4 "$d" && printf '%s ' "$d"; done
+}
+
+# Значения опции у пиров интерфейса: секции amneziawg_<if>, amneziawg3_<if>, wireguard_<if>
+peer_opts() { # iface option
+	uci -q show network | awk -v i="$1" -v o="$2" -v q="'" '
+		/^network\.[^.=]+=/ {
+			split($0, a, "="); split(a[1], b, ".")
+			if (a[2] == "amneziawg_" i || a[2] == "amneziawg3_" i || a[2] == "wireguard_" i) peer[b[2]] = 1
+			next
+		}
+		{
+			eq = index($0, "="); if (!eq) next
+			k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+			n = split(k, b, ".")
+			if (n == 3 && (b[2] in peer) && b[3] == o) { gsub(q, "", v); print v }
+		}'
+}
+
+peer_has_keepalive() {
+	local v
+	for v in $(peer_opts "$1" persistent_keepalive); do
+		[ -n "$v" ] && [ "$v" != 0 ] && return 0
+	done
+	return 1
+}
+
+awg_cli_for() {
+	local b
+	case "$1" in
+		amneziawg)  [ -x /usr/bin/awg ] && echo /usr/bin/awg ;;
+		amneziawg3) for b in /usr/libexec/amneziawg3/awg /usr/bin/awg3; do [ -x "$b" ] && { echo "$b"; return 0; }; done ;;
+		wireguard)  [ -x /usr/bin/wg ] && echo /usr/bin/wg ;;
+	esac
+	return 0
+}
+
+resolve4() {
+	if valid_ip4 "$1"; then echo "$1"; return 0; fi
+	case "$1" in *:*) return 0 ;; esac   # IPv6 — в IPv4-сет не кладём
+	# адреса из ответа идут после строки Name: (до неё — адрес самого DNS-сервера)
+	nslookup "$1" 2>/dev/null | awk '/^Name:/ { n = 1 } n && /^Address/ { a = $NF; if (a ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && a !~ /^127\./) print a }'
+}
+
+# IP всех endpoint'ов туннелей — их никогда не заворачиваем (иначе петля)
+collect_endpoints() {
+	local t h cli proto
+	: > "$STATE_DIR/endpoints4"
+	for t in $TUNNELS; do
+		tget "$t"
+		for h in $(peer_opts "$TIF" endpoint_host); do
+			h=${h#\[}; h=${h%\]}
+			resolve4 "$h" >> "$STATE_DIR/endpoints4"
+		done
+		proto=$(uci -q get network."$TIF".proto)
+		cli=$(awg_cli_for "$proto")
+		if [ -n "$cli" ] && [ -d "/sys/class/net/$TDEV" ]; then
+			"$cli" show "$TDEV" endpoints 2>/dev/null | awk '{ n = split($2, a, ":"); if (n == 2) print a[1] }' >> "$STATE_DIR/endpoints4"
+		fi
+	done
+}
+
+# Вышестоящие DNS dnsmasq (WAN, network.*.dns, dhcp 'server') — запросы к ним не заворачиваем.
+# Основная защита — правило по владельцу сокета (meta skuid dnsmasq), это запасная.
+collect_resolvers() {
+	local d
+	: > "$STATE_DIR/resolvers4"
+	for d in $(awk '$1 == "nameserver" { print $2 }' /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null) \
+		$(uci -q show network | sed -n "s/^network\.[^.]*\.dns=//p" | tr -d "'") \
+		$(uci -q show dhcp | sed -n "s/^dhcp\.[^.]*\.server=//p" | tr -d "'" | tr ' ' '\n' | grep -v '^/' | sed 's/[#@].*//'); do
+		valid_ip4 "$d" && echo "$d" >> "$STATE_DIR/resolvers4"
+	done
+	return 0
+}
+
+# uid пользователя dnsmasq (OpenWrt запускает его с --user=dnsmasq); пусто, если такого нет
+dnsmasq_uid() {
+	awk -F: '$1 == "dnsmasq" && $3 ~ /^[0-9]+$/ && $3 != 0 { print $3; exit }' /etc/passwd 2>/dev/null
+}
+
+# Списки, которых нет на диске -> $t.missing и MISSING
+check_missing() {
+	local t lists l
+	MISSING=""
+	for t in $TUNNELS; do
+		: > "$STATE_DIR/$t.missing"
+		config_get lists "$t" community_lists ''
+		for l in $lists; do
+			if [ -z "$(list_url "$l")" ]; then
+				cfg_err "туннель '$t': неизвестный список '$l'"
+				continue
+			fi
+			if [ ! -s "$LISTS_DIR/$l.lst" ]; then
+				echo "$l" >> "$STATE_DIR/$t.missing"; MISSING="$MISSING $l"
+			fi
+			if [ -n "$(list_net4_url "$l")" ] && [ ! -s "$LISTS_DIR/$l.net4.lst" ]; then
+				echo "$l (подсети)" >> "$STATE_DIR/$t.missing"; MISSING="$MISSING $l"
+			fi
+		done
+	done
+}
+
+# ------------------------------------------------------------------ dnsmasq
+
+dns_ok() {
+	case " $(dnsmasq --version 2>/dev/null | sed -n 's/^Compile time options: //p') " in
+		*" nftset "*) return 0 ;;
+	esac
+	return 1
+}
+
+# conf-dir, который реально читает dnsmasq (по умолчанию /tmp/dnsmasq.<секция>.d)
+detect_dnsmasq_dir() {
+	[ -n "$DNSDIR_OVR" ] && { echo "$DNSDIR_OVR"; return 0; }
+	(
+		. /lib/functions.sh
+		sec=""
+		_first() { [ -n "$sec" ] || sec="$1"; }
+		config_load dhcp
+		config_foreach _first dnsmasq
+		[ -n "$sec" ] || exit 1
+		config_get d "$sec" confdir "/tmp/dnsmasq${sec:+.$sec}.d"
+		echo "$d"
+	)
+}
+
+resolve_dnsmasq_file() {
+	local raw dir flt
+	DNSMASQ_FILE=""
+	raw=$(detect_dnsmasq_dir) || { log error "не нашёл секцию dnsmasq в /etc/config/dhcp"; return 1; }
+	dir="${raw%%,*}"
+	case "$dir" in /*) ;; *) log error "conf-dir dnsmasq '$raw' не абсолютный путь — домены не применяются"; return 1 ;; esac
+	if [ "$dir" != "$raw" ]; then
+		flt="${raw#*,}"
+		case "$flt" in
+			\**) case ",$flt," in *",*.conf,"*) ;; *) log error "conf-dir '$raw' не читает *.conf — домены не применяются"; return 1 ;; esac ;;
+		esac
+	fi
+	mkdir -p "$dir"
+	DNSMASQ_FILE="$dir/awgsplit.conf"
+}
+
+dnsmasq_restart() {
+	if /etc/init.d/dnsmasq restart >/dev/null 2>&1; then
+		log info "dnsmasq перезапущен"
+	else
+		log error "не смог перезапустить dnsmasq"
+	fi
+	# dnsmasq игнорирует server=...@dev, если устройства не было при старте — запомним такие
+	local d missing=""
+	for d in $(cat "$STATE_DIR/dns_devs" 2>/dev/null); do
+		[ -d "/sys/class/net/$d" ] || missing="$missing $d"
+	done
+	echo "$missing" > "$STATE_DIR/dns_devs_missing"
+}
+
+dns_dev_check() {
+	local d need=0
+	for d in $(cat "$STATE_DIR/dns_devs_missing" 2>/dev/null); do
+		[ -d "/sys/class/net/$d" ] && need=1
+	done
+	[ "$need" = 1 ] || return 0
+	log info "туннель для DNS поднялся — перезапускаю dnsmasq"
+	dnsmasq_restart
+}
+
+domains_cb() {
+	local s="$1" tun en dom
+	config_get tun "$s" tunnel ''
+	[ "$tun" = "$DOM_TARGET" ] || return 0
+	config_get_bool en "$s" enabled 1
+	[ "$en" = 1 ] || return 0
+	config_get dom "$s" domains ''
+	[ -n "$dom" ] || return 0
+	printf '%s\n' "$dom" | awk -v t="$DOM_TARGET" '
+		{ sub(/#.*/, ""); n = split($0, a, /[ \t\r,;]+/); for (i = 1; i <= n; i++) if (a[i] != "") print t "\tu\t" a[i] }' >> "$DOM_SRC"
+}
+
+domains_orphans_cb() {
+	local s="$1" tun en
+	config_get_bool en "$s" enabled 1
+	[ "$en" = 1 ] || return 0
+	config_get tun "$s" tunnel ''
+	tunnel_listed "$tun" || cfg_err "список доменов '$s' привязан к туннелю '$tun', которого нет или он выключен — список не применяется"
+}
+
+# DNS-серверы для доменов туннеля: того туннеля, через который сейчас реально идёт трафик
+tunnel_servers() { # tunnel -> "ip@dev ..." ; пусто = обычный DNS провайдера
+	local t="$1" route via ifc ip
+	route=$(cat "$STATE_DIR/$t.route" 2>/dev/null)
+	case "$route" in
+		tunnel)     via="$t" ;;
+		fallback:*) via="${route#fallback:}" ;;
+		*)          return 0 ;;
+	esac
+	tunnel_listed "$via" || return 0
+	config_get ifc "$via" interface ''
+	for ip in $(tunnel_dns "$via" "$ifc"); do printf '%s@%s ' "$ip" "$(tunnel_dev "$ifc")"; done
+}
+
+# Собирает конфиг dnsmasq во временный файл.
+#   CONF_CHANGED=1  — отличается от текущего
+#   FLUSH_TUNNELS   — туннели, из которых пропали домены (их сеты надо очистить)
+build_dnsmasq_conf() {
+	local t l k s4 s6 lists srv dev out
+	CONF_CHANGED=0; FLUSH_TUNNELS=""
+	DNSMASQ_TMP=$(mktemp /tmp/awgsplit-dnsmasq.XXXXXX) || return 1
+	DOM_SRC=$(mktemp /tmp/awgsplit-src.XXXXXX) || { rm -f "$DNSMASQ_TMP"; return 1; }
+	echo "# awgsplit: сгенерировано автоматически, не редактировать" > "$DNSMASQ_TMP"
+	if [ "$BLOCK_DOH" = 1 ]; then
+		# Firefox и iCloud Private Relay иначе ходят в DNS мимо роутера
+		printf 'address=/use-application-dns.net/\naddress=/mask.icloud.com/\naddress=/mask-h2.icloud.com/\n' >> "$DNSMASQ_TMP"
+	fi
+
+	# Приоритет при совпадении домена: сначала свои списки (туннели по приоритету), потом готовые.
+	# Более конкретный домен (a.example.com) всегда главнее общего (example.com) — так работает dnsmasq.
+	# Свои домены идут в отдельные сеты ${t}_uip*, готовые — в ${t}_ip*: в nft свои проверяются раньше.
+	for t in $TUNNELS; do DOM_TARGET="$t"; config_foreach domains_cb domains; done
+	config_foreach domains_orphans_cb domains
+	for t in $TUNNELS; do
+		config_get lists "$t" community_lists ''
+		for l in $lists; do
+			[ -n "$(list_url "$l")" ] && [ -s "$LISTS_DIR/$l.lst" ] || continue
+			awk -v t="$t" '{ print t "\tc\t" $0 }' "$LISTS_DIR/$l.lst" >> "$DOM_SRC"
+		done
+	done
+
+	rm -f "$STATE_DIR"/*.domains "$STATE_DIR"/*.udom "$STATE_DIR"/*.cdom
+	awk -F '\t' -v dir="$STATE_DIR" '
+		function norm(d,   n, i, L) {
+			sub(/#.*/, "", d); gsub(/[ \t\r]/, "", d); d = tolower(d)
+			sub(/^\*\./, "", d); sub(/^\.+/, "", d); sub(/\.+$/, "", d)
+			if (d == "" || length(d) > 253 || d ~ /[^a-z0-9.-]/) return ""
+			n = split(d, L, ".")
+			for (i = 1; i <= n; i++) {
+				if (length(L[i]) < 1 || length(L[i]) > 63) return ""
+				if (L[i] ~ /^-/ || L[i] ~ /-$/) return ""
+			}
+			return d
+		}
+		{
+			d = norm($3)
+			if (d == "") { bad++; next }
+			if (d in owner) next
+			owner[d] = $1
+			print d > (dir "/" $1 "." $2 "dom")
+			print $2 " " d > (dir "/" $1 ".domains")
+		}
+		END { print bad + 0 > (dir "/domain_bad") }' "$DOM_SRC"
+	rm -f "$DOM_SRC"
+
+	: > "$STATE_DIR/dns_devs"
+	for t in $TUNNELS; do
+		# если из туннеля пропали домены (или все) — его сеты надо очистить, иначе старые IP останутся в туннеле
+		if [ -s "$STATE_DIR/$t.applied" ]; then
+			if [ ! -s "$STATE_DIR/$t.domains" ] || awk -v f="$STATE_DIR/$t.domains" '
+				BEGIN { while ((getline l < f) > 0) n[l] = 1 }
+				!($0 in n) { gone = 1; exit }
+				END { exit !gone }' "$STATE_DIR/$t.applied"; then
+				FLUSH_TUNNELS="$FLUSH_TUNNELS $t"
+			fi
+		fi
+		[ -s "$STATE_DIR/$t.domains" ] || continue
+		srv=$(tunnel_servers "$t")
+		for dev in $(echo "$srv" | tr ' ' '\n' | sed -n 's/.*@//p'); do echo "$dev" >> "$STATE_DIR/dns_devs"; done
+		if [ -z "$srv" ] && [ "$(cat "$STATE_DIR/$t.route" 2>/dev/null)" = tunnel ] && [ "$QUIET" != 1 ]; then
+			log warn "туннель '$t': DNS туннеля не задан — домены резолвятся через провайдера (возможна подмена IP)"
+		fi
+		for k in u c; do
+			[ -s "$STATE_DIR/$t.${k}dom" ] || continue
+			if [ "$k" = u ]; then s4="${t}_uip4"; s6="${t}_uip6"; else s4="${t}_ip4"; s6="${t}_ip6"; fi
+			awk -v spec="4#inet#$T#$s4,6#inet#$T#$s6" -v srv="$srv" -v maxlen=700 '
+				function flush(   n, i, S) {
+					if (b == "") return
+					print "nftset=" b "/" spec
+					n = split(srv, S, " ")
+					for (i = 1; i <= n; i++) if (S[i] != "") print "server=" b "/" S[i]
+					b = ""
+				}
+				{ if (b != "" && length(b) + length($0) + 1 > maxlen) flush(); b = b "/" $0 }
+				END { flush() }' "$STATE_DIR/$t.${k}dom" >> "$DNSMASQ_TMP"
+		done
+	done
+
+	if ! awk 'length($0) > 1000 { exit 1 }' "$DNSMASQ_TMP"; then
+		log error "в конфиге dnsmasq строка длиннее 1000 символов — не применяю"
+		rm -f "$DNSMASQ_TMP"; return 1
+	fi
+	if ! out=$(dnsmasq --test -C "$DNSMASQ_TMP" 2>&1); then
+		log error "dnsmasq отверг сгенерированный конфиг ($out) — оставляю прежний"
+		rm -f "$DNSMASQ_TMP"; return 1
+	fi
+	cmp -s "$DNSMASQ_TMP" "$DNSMASQ_FILE" 2>/dev/null || CONF_CHANGED=1
+	return 0
+}
+
+dnsmasq_commit() {
+	local t
+	if [ "$CONF_CHANGED" = 1 ]; then
+		chmod 644 "$DNSMASQ_TMP"
+		mv -f "$DNSMASQ_TMP" "$DNSMASQ_FILE"
+		# conf-dir читается только при старте dnsmasq — нужен restart, reload (SIGHUP) не поможет
+		dnsmasq_restart
+	else
+		rm -f "$DNSMASQ_TMP"
+		# сеты пустые (новые или очищенные) — сбросим кэш dnsmasq, чтобы IP снова попали в сеты
+		if [ "$TABLE_NEW" = 1 ] || [ -n "$FLUSH_TUNNELS" ]; then
+			/etc/init.d/dnsmasq reload >/dev/null 2>&1
+		fi
+	fi
+	for t in $TUNNELS; do
+		if [ -s "$STATE_DIR/$t.domains" ]; then cp "$STATE_DIR/$t.domains" "$STATE_DIR/$t.applied"
+		else rm -f "$STATE_DIR/$t.applied"; fi
+	done
+	echo "$DNSMASQ_FILE" > "$STATE_DIR/dnsmasq_file"
+}
+
+dnsmasq_drop() {
+	local f="$1"
+	[ -n "$f" ] && [ -f "$f" ] || return 0
+	rm -f "$f"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	log info "конфиг dnsmasq awgsplit удалён"
+}
+
+# ------------------------------------------------------------------ nftables
+
+# CIDR-список -> непересекающиеся диапазоны (чтобы nft не спотыкался о перекрытия).
+# Числа печатаются одинаковой ширины и сортируются как строки: `sort -n` в BusyBox
+# OpenWrt сравнивает через int и ломается на адресах от 128.0.0.0.
+cidr_ranges() {
+	[ -s "$1" ] || return 0
+	awk -F'[./]' '
+		NF == 4 || NF == 5 {
+			for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i + 0 > 255) next
+			m = (NF == 5) ? $5 : 32
+			if (m !~ /^[0-9]+$/ || m + 0 > 32) next
+			ip = (($1 * 256 + $2) * 256 + $3) * 256 + $4
+			size = 2 ^ (32 - m)
+			s = ip - (ip % size)
+			printf "%010.0f %010.0f\n", s, s + size - 1
+		}' "$1" | sort | awk '
+		function ip(n) { return int(n / 16777216) "." (int(n / 65536) % 256) "." (int(n / 256) % 256) "." (n % 256) }
+		function out() { print (s == e) ? ip(s) : ip(s) "-" ip(e) }
+		NR == 1 { s = $1 + 0; e = $2 + 0; next }
+		{ if ($1 + 0 <= e + 1) { if ($2 + 0 > e) e = $2 + 0 } else { out(); s = $1 + 0; e = $2 + 0 } }
+		END { if (NR) out() }'
+}
+
+# строки add element по 200 штук; вход — готовые элементы по одному на строку
+elems() { # set
+	awk -v t="$T" -v s="$1" '
+		$0 != "" && !seen[$0]++ {
+			b = b (n ? ", " : "") $0; n++
+			if (n == 200) { print "add element inet " t " " s " { " b " }"; b = ""; n = 0 }
+		}
+		END { if (n) print "add element inet " t " " s " { " b " }" }'
+}
+
+ip4_only() { [ -s "$1" ] && grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' "$1" | awk -F. '$1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255'; return 0; }
+
+build_subnets() { # t -> $STATE_DIR/$t.unet4 (свои), $t.net4 и $t.dsc4 (из списков)
+	local t="$1" nets n lists l
+	: > "$STATE_DIR/$t.unet4"; : > "$STATE_DIR/$t.net4"; : > "$STATE_DIR/$t.dsc4"
+	config_get nets "$t" subnets ''
+	for n in $nets; do
+		if valid_cidr4 "$n"; then echo "$n" >> "$STATE_DIR/$t.unet4"
+		else cfg_err "туннель '$t': неверная подсеть '$n'"; fi
+	done
+	config_get lists "$t" community_lists ''
+	for l in $lists; do
+		[ -n "$(list_net4_url "$l")" ] && [ -s "$LISTS_DIR/$l.net4.lst" ] || continue
+		# подсети Discord — это Cloudflare и Google Cloud целиком, берём только голосовой UDP
+		if [ "$l" = discord ]; then cat "$LISTS_DIR/$l.net4.lst" >> "$STATE_DIR/$t.dsc4"
+		else cat "$LISTS_DIR/$l.net4.lst" >> "$STATE_DIR/$t.net4"; fi
+	done
+}
+
+# "устройство:MSS ..." для устройств туннелей (MSS = MTU туннеля - 40).
+# mtu_fix из fw4 тут не помогает: он считает MTU по маршруту без метки, то есть через WAN (1500),
+# и крупные сегменты устройств LAN не пролезают в туннель — страдает прежде всего отдача.
+mss_spec() {
+	local t mtu out=""
+	for t in $TUNNELS; do
+		tget "$t"
+		case "$TDEV" in ''|*[!A-Za-z0-9_.-]*) continue ;; esac
+		case " $out " in *" $TDEV:"*) continue ;; esac
+		mtu=$(cat "/sys/class/net/$TDEV/mtu" 2>/dev/null)
+		[ -n "$mtu" ] || mtu=$(uci -q get network."$TIF".mtu)
+		mtu=$(num "$mtu" 1376)
+		{ [ "$mtu" -ge 576 ] && [ "$mtu" -le 9000 ]; } || mtu=1376
+		out="$out $TDEV:$((mtu - 40))"
+	done
+	echo "${out# }"
+}
+
+build_nft_rules() {
+	local f="$STATE_DIR/nft.rules" t s marks="" lan="" i uid x d m
+	for t in $TUNNELS; do tget "$t"; marks="$marks${marks:+, }$TMARK"; done
+	uid=$(dnsmasq_uid)
+	for i in $LAN_IFACES; do
+		case "$i" in *[!A-Za-z0-9_.-]*) log warn "пропускаю странное имя LAN-интерфейса '$i'"; continue ;; esac
+		lan="$lan${lan:+, }\"$i\""
+	done
+	[ -n "$lan" ] || lan='"br-lan"'
+	{
+		echo "add table inet $T"
+		echo "add chain inet $T pick"
+		echo "add chain inet $T pick_out"
+		echo "add chain inet $T prerouting { type filter hook prerouting priority mangle; policy accept; }"
+		echo "add chain inet $T output { type route hook output priority mangle; policy accept; }"
+		echo "add chain inet $T forward { type filter hook forward priority mangle; policy accept; }"
+		echo "flush chain inet $T forward"
+		echo "flush chain inet $T pick"
+		echo "flush chain inet $T pick_out"
+		echo "flush chain inet $T prerouting"
+		echo "flush chain inet $T output"
+		echo "add set inet $T bypass4 { type ipv4_addr; flags interval; }"
+		echo "flush set inet $T bypass4"
+		echo "add element inet $T bypass4 { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }"
+		echo "add set inet $T bypass6 { type ipv6_addr; flags interval; }"
+		echo "flush set inet $T bypass6"
+		echo "add element inet $T bypass6 { ::/127, fc00::/7, fe80::/10, ff00::/8 }"
+		for s in endpoints4 resolvers4; do
+			echo "add set inet $T $s { type ipv4_addr; }"
+			echo "flush set inet $T $s"
+			ip4_only "$STATE_DIR/$s" | elems "$s"
+		done
+		for t in $TUNNELS; do
+			for s in uip4 ip4; do echo "add set inet $T ${t}_$s { type ipv4_addr; }"; done
+			for s in uip6 ip6; do echo "add set inet $T ${t}_$s { type ipv6_addr; }"; done
+			case " $FLUSH_TUNNELS " in *" $t "*)
+				for s in uip4 uip6 ip4 ip6; do echo "flush set inet $T ${t}_$s"; done ;;
+			esac
+			for s in unet4 net4 dsc4; do
+				echo "add set inet $T ${t}_$s { type ipv4_addr; flags interval; }"
+				echo "flush set inet $T ${t}_$s"
+				cidr_ranges "$STATE_DIR/$t.$s" | elems "${t}_$s"
+			done
+		done
+
+		# Выбор туннеля — один раз на новое соединение, результат в ct mark. Кто раньше — тот и победил:
+		#   endpoint'ы VPN мимо -> свои подсети -> служебные диапазоны мимо -> свои домены ->
+		#   домены готовых списков -> подсети готовых списков. Внутри уровня — по приоритету туннелей.
+		echo "add rule inet $T pick ip daddr @endpoints4 return"
+		for t in $TUNNELS; do
+			tget "$t"
+			echo "add rule inet $T pick ip daddr @${t}_unet4 ct mark set $TMARK return"
+		done
+		echo "add rule inet $T pick ip daddr @bypass4 return"
+		echo "add rule inet $T pick ip6 daddr @bypass6 return"
+		for s in uip ip; do
+			for t in $TUNNELS; do
+				tget "$t"
+				echo "add rule inet $T pick ip daddr @${t}_${s}4 ct mark set $TMARK return"
+				echo "add rule inet $T pick ip6 daddr @${t}_${s}6 ct mark set $TMARK return"
+			done
+		done
+		for t in $TUNNELS; do
+			tget "$t"
+			echo "add rule inet $T pick ip daddr @${t}_net4 ct mark set $TMARK return"
+			echo "add rule inet $T pick ip daddr @${t}_dsc4 udp dport { 19000-20000, 50000-65535 } ct mark set $TMARK return"
+		done
+
+		# Ответы никогда не маршрутизируем в туннель; решение — только для новых соединений из LAN
+		echo "add rule inet $T prerouting ct direction reply return"
+		echo "add rule inet $T prerouting iifname { $lan } ct state new jump pick"
+		echo "add rule inet $T prerouting ct mark { $marks } meta mark set ct mark"
+		# Трафик самого роутера: чужие метки не трогаем; вышестоящие запросы dnsmasq — всегда мимо
+		# (DNS для доменов туннелей dnsmasq сам отправляет в нужный интерфейс через server=...@dev)
+		echo "add rule inet $T output ct direction reply return"
+		echo "add rule inet $T output meta mark != 0 return"
+		echo "add rule inet $T output ct state new jump pick_out"
+		# Выбор для трафика роутера: как pick, но вышестоящие DNS dnsmasq (кроме заданных
+		# «Своими подсетями») никогда не уходят в туннель по готовым спискам или своим доменам
+		echo "add rule inet $T pick_out ip daddr @endpoints4 return"
+		for t in $TUNNELS; do
+			tget "$t"
+			echo "add rule inet $T pick_out ip daddr @${t}_unet4 ct mark set $TMARK return"
+		done
+		[ -n "$uid" ] && echo "add rule inet $T pick_out meta skuid $uid return"
+		echo "add rule inet $T pick_out ip daddr @resolvers4 return"
+		echo "add rule inet $T pick_out goto pick"
+		echo "add rule inet $T output ct mark { $marks } meta mark set ct mark"
+
+		# TCP MSS под MTU туннеля — для SYN из LAN в туннель и для SYN-ACK из туннеля в LAN
+		for x in $MSS_SPEC; do
+			d=${x%%:*}; m=${x#*:}
+			echo "add rule inet $T forward oifname \"$d\" tcp flags & (fin | syn | rst) == syn tcp option maxseg size > $m tcp option maxseg size set $m"
+			echo "add rule inet $T forward iifname \"$d\" tcp flags & (fin | syn | rst) == syn tcp option maxseg size > $m tcp option maxseg size set $m"
+		done
+	} > "$f"
+}
+
+nft_apply() {
+	local out
+	out=$(nft -f "$STATE_DIR/nft.rules" 2>&1) && return 0
+	log warn "nft: $out — пересоздаю таблицу"
+	nft delete table inet $T 2>/dev/null
+	TABLE_NEW=1
+	out=$(nft -f "$STATE_DIR/nft.rules" 2>&1) && return 0
+	log error "nft не принял правила: $out"
+	return 1
+}
+
+nft_drop_stale_sets() {
+	local s t keep
+	for s in $(nft list table inet $T 2>/dev/null | awk '$1 == "set" { print $2 }'); do
+		case "$s" in bypass4|bypass6|endpoints4|resolvers4) continue ;; esac
+		keep=0
+		for t in $TUNNELS; do
+			case "$s" in "${t}_uip4"|"${t}_uip6"|"${t}_ip4"|"${t}_ip6"|"${t}_unet4"|"${t}_net4"|"${t}_dsc4") keep=1 ;; esac
+		done
+		[ "$keep" = 1 ] || nft delete set inet $T "$s" 2>/dev/null
+	done
+	return 0
+}
+
+nft_flush_dns_sets() {
+	local t s
+	for t in $FLUSH_TUNNELS; do
+		for s in uip4 uip6 ip4 ip6; do nft flush set inet $T "${t}_$s" 2>/dev/null; done
+	done
+	return 0
+}
+
+set_count() { # set -> число элементов
+	nft list set inet $T "$1" 2>/dev/null | awk '
+		/elements = \{/ { f = 1; c = 0 }
+		f { c += gsub(/,/, ",") }
+		f && /\}/ { print c + 1; done = 1; exit }
+		END { if (!done) print 0 }'
+}
+
+# ------------------------------------------------------------------ маршруты
+
+ensure_suppress() {
+	ip rule show 2>/dev/null | grep -q "suppress_prefixlength 0" && return 0
+	# маршруты main конкретнее default (LAN, WAN-подсеть) побеждают туннель
+	ip rule add lookup main suppress_prefixlength 0 priority "$SUPPRESS_PRIO" 2>/dev/null \
+		|| log warn "ip rule suppress_prefixlength не поддерживается — пропускаю"
+	return 0
+}
+
+drop_suppress() {
+	ip rule del lookup main suppress_prefixlength 0 priority "$SUPPRESS_PRIO" 2>/dev/null
+	return 0
+}
+
+ensure_rules() { # mark table prio
+	ip rule show 2>/dev/null | grep -qiE "^$3:[[:space:]].*fwmark $1 lookup $2([[:space:]]|\$)" \
+		|| ip rule add fwmark "$1" lookup "$2" priority "$3" 2>/dev/null \
+		|| { log error "не смог добавить ip rule fwmark $1 lookup $2"; return 1; }
+	# туннель только IPv4: IPv6 к этим адресам сразу отклоняем, клиент уйдёт на IPv4
+	if [ -d /proc/sys/net/ipv6 ]; then
+		ip -6 rule show 2>/dev/null | grep -qiE "fwmark $1 .*unreachable" \
+			|| ip -6 rule add fwmark "$1" priority "$3" unreachable 2>/dev/null \
+			|| log debug "ip -6 rule unreachable не поддерживается"
+	fi
+	return 0
+}
+
+drop_rules() { # mark table
+	local i
+	valid_mark "$1" || return 0
+	i=0; while ip rule del fwmark "$1" 2>/dev/null; do i=$((i + 1)); [ "$i" -gt 20 ] && break; done
+	i=0; while ip -6 rule del fwmark "$1" 2>/dev/null; do i=$((i + 1)); [ "$i" -gt 20 ] && break; done
+	valid_table "$2" && ip route flush table "$2" 2>/dev/null
+	return 0
+}
+
+# Сбросить conntrack соединений с этой меткой: у них NAT-адрес туннеля, по новому пути они бы
+# молча висели. Следующий пакет создаст запись заново, приложение быстро переподключится.
+ct_flush_mark() {
+	valid_mark "$1" || return 0
+	command -v conntrack >/dev/null 2>&1 && conntrack -D -m "$1" >/dev/null 2>&1
+	return 0
+}
+
+# Правила туннелей, которых больше нет в конфиге или у которых сменилась метка/таблица/приоритет/устройство
+cleanup_stale() {
+	local f t m tb p d
+	for f in "$STATE_DIR"/*.mark; do
+		[ -f "$f" ] || continue
+		t=${f##*/}; t=${t%.mark}
+		m=$(cat "$f"); tb=$(cat "$STATE_DIR/$t.table" 2>/dev/null); p=$(cat "$STATE_DIR/$t.prio" 2>/dev/null)
+		d=$(cat "$STATE_DIR/$t.dev" 2>/dev/null)
+		if tunnel_listed "$t"; then
+			tget "$t"
+			# туннель переехал на другой интерфейс: пометим маршрут как сменившийся —
+			# sync_routes сбросит conntrack уже ПОСЛЕ перевода таблицы на новое устройство
+			[ -n "$d" ] && [ "$d" != "$TDEV" ] && echo moved > "$STATE_DIR/$t.route"
+			[ "$m" = "$TMARK" ] && [ "$tb" = "$TTABLE" ] && [ "$p" = "$TPRIO" ] && continue
+			drop_rules "$m" "$tb"
+			[ "$m" != "$TMARK" ] && ct_flush_mark "$m"
+			rm -f "$STATE_DIR/$t.mark" "$STATE_DIR/$t.table" "$STATE_DIR/$t.prio" "$STATE_DIR/$t.route"
+		else
+			drop_rules "$m" "$tb"
+			ct_flush_mark "$m"
+			rm -f "$STATE_DIR/$t".*
+		fi
+	done
+	return 0
+}
+
+hs_latest() { # dev proto -> unix-время последнего handshake (0 = не было); код 1 = не удалось узнать
+	local cli out
+	cli=$(awg_cli_for "$2"); [ -n "$cli" ] || return 1
+	out=$("$cli" show "$1" latest-handshakes 2>/dev/null) || return 1
+	[ -n "$out" ] || return 1
+	echo "$out" | awk '{ if ($2 + 0 > m) m = $2 + 0 } END { print m + 0 }'
+}
+
+iface_uptime() {
+	ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null
+}
+
+# сколько секунд без handshake считаем нормой: 300 или RekeyAfterTime + 180
+hs_limit() {
+	local rk
+	rk=$(uci -q get network."$1".awg_rekey_after_time || uci -q get network."$1".rekey_after_time)
+	rk=$(range_max "$rk" 0)
+	if [ $((rk + 180)) -gt 300 ]; then echo $((rk + 180)); else echo 300; fi
+}
+
+# TSTATE: up | pending | unknown | down | nodev ; HS_AGE: секунды или -1
+eval_tunnel() { # iface dev check
+	local iface="$1" dev="$2" check="$3" proto hs now up
+	HS_AGE=-1
+	[ -d "/sys/class/net/$dev" ] || { TSTATE=nodev; return; }
+	[ "$check" = 1 ] || { TSTATE=unknown; return; }
+	proto=$(uci -q get network."$iface".proto)
+	hs=$(hs_latest "$dev" "$proto") || { TSTATE=unknown; return; }
+	now=$(date +%s)
+	[ "$hs" -gt 0 ] && HS_AGE=$((now - hs))
+	if [ "$hs" -gt 0 ] && [ "$HS_AGE" -le "$(hs_limit "$iface")" ]; then TSTATE=up; return; fi
+	up=$(num "$(iface_uptime "$iface")" 99999)
+	[ "$up" -lt 120 ] && { TSTATE=pending; return; }
+	# без keepalive бездействующий туннель не обновляет handshake — судить нельзя
+	peer_has_keepalive "$iface" || { TSTATE=unknown; return; }
+	TSTATE=down
+}
+
+# Приводит маршруты таблиц в соответствие с живостью туннелей. ROUTE_CHANGED=1 если что-то переключилось.
+sync_routes() { # check(0|1)
+	local check="$1" t st fails usable prev fb fbst fbdev m ct_flush=""
+	ROUTE_CHANGED=0
+	ensure_suppress
+	for t in $TUNNELS; do
+		tget "$t"
+		eval_tunnel "$TIF" "$TDEV" "$check"
+		fails=$(num "$(cat "$STATE_DIR/$t.fails" 2>/dev/null)")
+		case "$TSTATE" in down|nodev) fails=$((fails + 1)) ;; *) fails=0 ;; esac
+		echo "$fails" > "$STATE_DIR/$t.fails"
+		echo "$TSTATE" > "$STATE_DIR/$t.health"
+		echo "$HS_AGE" > "$STATE_DIR/$t.hsage"
+		# ответы из туннеля приходят с «чужого» интерфейса — строгий rp_filter их бы отбросил
+		[ -w "/proc/sys/net/ipv4/conf/$TDEV/rp_filter" ] && echo 2 > "/proc/sys/net/ipv4/conf/$TDEV/rp_filter"
+		eval "ST_$t=\$TSTATE; FA_$t=\$fails"
+	done
+	for t in $TUNNELS; do
+		tget "$t"
+		ensure_rules "$TMARK" "$TTABLE" "$TPRIO"
+		eval "st=\$ST_$t; fails=\$FA_$t"
+		usable=0
+		case "$st" in
+			up|pending|unknown) usable=1 ;;
+			down) [ "$fails" -lt 2 ] && usable=1 ;;   # одну неудачную проверку прощаем
+		esac
+		prev=$(cat "$STATE_DIR/$t.route" 2>/dev/null)
+		if [ "$usable" = 1 ] && ip route replace default dev "$TDEV" table "$TTABLE" 2>/dev/null; then
+			[ "$prev" = tunnel ] || { log info "'$TLABEL': трафик идёт через $TDEV"; ROUTE_CHANGED=1; [ -n "$prev" ] && ct_flush="$ct_flush $TMARK"; }
+			echo tunnel > "$STATE_DIR/$t.route"
+			continue
+		fi
+		fb="$TFB"; fbst=""; fbdev=""
+		if [ -n "$fb" ]; then
+			eval "fbst=\$ST_$fb"
+			fbdev=$(tunnel_dev "$(uci -q get awgsplit."$fb".interface)")
+			case "$fbst" in up|pending|unknown) ;; *) fb="" ;; esac
+		fi
+		if [ -n "$fb" ] && ip route replace default dev "$fbdev" table "$TTABLE" 2>/dev/null; then
+			[ "$prev" = "fallback:$fb" ] || { log warn "'$TLABEL' недоступен ($st) — трафик переключён на запасной туннель '$fb'"; ROUTE_CHANGED=1; [ -n "$prev" ] && ct_flush="$ct_flush $TMARK"; }
+			echo "fallback:$fb" > "$STATE_DIR/$t.route"
+		else
+			ip route flush table "$TTABLE" 2>/dev/null
+			[ "$prev" = direct ] || { log warn "'$TLABEL' недоступен ($st) — его трафик идёт напрямую"; ROUTE_CHANGED=1; [ -n "$prev" ] && ct_flush="$ct_flush $TMARK"; }
+			echo direct > "$STATE_DIR/$t.route"
+		fi
+	done
+	# у открытых соединений остался старый NAT-адрес — сбрасываем их
+	for m in $ct_flush; do ct_flush_mark "$m"; done
+	return 0
+}
+
+# ------------------------------------------------------------------ фоновые загрузки
+
+# Фоновая загрузка списков. Не чаще раза в 30 минут, кроме списков, которые ещё ни разу не пробовали качать.
+maybe_autofetch() { # причина [списки]
+	[ -n "$AWGSPLIT_NO_AUTOFETCH" ] && return 0
+	local now la l fresh=0
+	now=$(date +%s)
+	la=$(num "$(cat "$LISTS_DIR/.last_attempt" 2>/dev/null)")
+	for l in $2; do
+		grep -qx "$l" "$LISTS_DIR/.last_attempt_lists" 2>/dev/null || fresh=1
+	done
+	[ "$fresh" = 1 ] || [ $((now - la)) -ge 1800 ] || return 0
+	# загрузка уже идёт; брошенную блокировку (процесс убит) игнорируем — update снимет её сам
+	if [ -d "$FETCHLOCK" ]; then
+		la=$(cat "$FETCHLOCK/pid" 2>/dev/null)
+		[ -n "$la" ] && kill -0 "$la" 2>/dev/null && return 0
+	fi
+	log info "$1 — запускаю загрузку списков в фоне"
+	# 1000>&- — не держать блокировку procd init-скрипта, пока идёт загрузка
+	( AWGSPLIT_NO_AUTOFETCH=1 "$BIN" update >/dev/null 2>&1 </dev/null 1000>&- & )
+}
+
+autoupdate_check() {
+	local now lu
+	now=$(date +%s)
+	lu=$(num "$(cat "$LISTS_DIR/.last_update" 2>/dev/null)")
+	if [ $((now - lu)) -ge $((UPDATE_INT * 3600)) ]; then
+		maybe_autofetch "подошло время обновить списки"
+	elif grep -qs '[^[:space:]]' "$LISTS_DIR/.failed" || cat "$STATE_DIR"/*.missing 2>/dev/null | grep -q .; then
+		maybe_autofetch "есть недокачанные списки"
+	fi
+	return 0
+}
+
+# ------------------------------------------------------------------ основные операции
+
+# Пересобрать конфиг dnsmasq (после переключения туннеля DNS должен идти туда же, куда трафик)
+dns_refresh() {
+	dns_ok || return 0
+	resolve_dnsmasq_file || return 0
+	TABLE_NEW=0
+	build_dnsmasq_conf || return 0
+	nft_flush_dns_sets
+	dnsmasq_commit
+}
+
+stop_internal() {
+	local f t m tb
+	# сначала снимаем маркировку, потом правила и conntrack — иначе в промежутке
+	# новые записи успели бы получить метку туннеля с NAT-адресом WAN
+	nft delete table inet $T 2>/dev/null
+	for f in "$STATE_DIR"/*.mark; do
+		[ -f "$f" ] || continue
+		t=${f##*/}; t=${t%.mark}
+		m=$(cat "$f"); tb=$(cat "$STATE_DIR/$t.table" 2>/dev/null)
+		drop_rules "$m" "$tb"
+		ct_flush_mark "$m"
+	done
+	drop_suppress
+	f=$(cat "$STATE_DIR/dnsmasq_file" 2>/dev/null)
+	if [ -z "$f" ] && resolve_dnsmasq_file 2>/dev/null; then f="$DNSMASQ_FILE"; fi
+	dnsmasq_drop "$f"
+	rm -rf "$STATE_DIR"
+}
+
+start_internal() {
+	local t old
+	mkdir -p "$STATE_DIR" "$LISTS_DIR"
+	config_load "$CONF"
+	load_global
+	if [ "$ENABLED" != 1 ]; then
+		log info "awgsplit выключен в настройках"
+		stop_internal
+		return 0
+	fi
+	collect_tunnels
+	if [ -z "$TUNNELS" ]; then
+		log warn "нет ни одного рабочего туннеля — всё идёт напрямую"
+		stop_internal
+		mkdir -p "$STATE_DIR"
+		printf '%s' "$CFG_ERRORS" > "$STATE_DIR/errors"
+		return 0
+	fi
+
+	cleanup_stale
+	check_missing
+	collect_endpoints
+	collect_resolvers
+	for t in $TUNNELS; do build_subnets "$t"; done
+	for t in $TUNNELS; do
+		tget "$t"
+		echo "$TMARK"  > "$STATE_DIR/$t.mark"
+		echo "$TTABLE" > "$STATE_DIR/$t.table"
+		echo "$TPRIO"  > "$STATE_DIR/$t.prio"
+		echo "$TDEV"   > "$STATE_DIR/$t.dev"
+	done
+
+	# маршруты до DNS: серверы для доменов зависят от того, какой туннель жив
+	sync_routes "$HEALTHCHECK"
+
+	DNS_READY=0; FLUSH_TUNNELS=""; CONF_CHANGED=0
+	old=$(cat "$STATE_DIR/dnsmasq_file" 2>/dev/null)
+	if ! dns_ok; then
+		log error "dnsmasq собран без nftset (нужен dnsmasq-full) — работают только подсети, домены не заворачиваются"
+		dnsmasq_drop "$old"
+		rm -f "$STATE_DIR/dnsmasq_file" "$STATE_DIR"/*.applied
+	elif resolve_dnsmasq_file; then
+		if [ -n "$old" ] && [ "$old" != "$DNSMASQ_FILE" ]; then dnsmasq_drop "$old"; fi
+		build_dnsmasq_conf && DNS_READY=1
+	fi
+
+	TABLE_NEW=0
+	nft list table inet $T >/dev/null 2>&1 || TABLE_NEW=1
+	MSS_SPEC=$(mss_spec)
+	build_nft_rules
+	if ! nft_apply; then
+		[ "$DNS_READY" = 1 ] && rm -f "$DNSMASQ_TMP"
+		printf '%s' "$CFG_ERRORS" > "$STATE_DIR/errors"
+		return 1
+	fi
+	nft_drop_stale_sets
+	echo "$MSS_SPEC" > "$STATE_DIR/mss"
+
+	[ "$DNS_READY" = 1 ] && dnsmasq_commit
+
+	printf '%s' "$CFG_ERRORS" > "$STATE_DIR/errors"
+	date +%s > "$STATE_DIR/started"
+	log info "awgsplit запущен, туннели: $TUNNELS"
+	[ -n "$MISSING" ] && maybe_autofetch "не скачаны списки:$MISSING" "$MISSING"
+	return 0
+}
+
+cmd_start() {
+	lock_acquire 60 || { log error "другой экземпляр awgsplit занят — пропускаю"; return 1; }
+	start_internal; local rc=$?
+	lock_release
+	return $rc
+}
+
+cmd_stop() {
+	lock_acquire 60 || { log error "другой экземпляр awgsplit занят — пропускаю"; return 1; }
+	config_load "$CONF"; load_global
+	stop_internal
+	lock_release
+	log info "awgsplit остановлен"
+}
+
+cmd_restart() {
+	lock_acquire 60 || { log error "другой экземпляр awgsplit занят — пропускаю"; return 1; }
+	config_load "$CONF"; load_global
+	stop_internal
+	start_internal; local rc=$?
+	lock_release
+	return $rc
+}
+
+# Применить настройки, только если служба запущена. Проверка — под блокировкой,
+# чтобы фоновая задача не подняла службу обратно сразу после stop.
+cmd_apply() {
+	lock_acquire 60 || { log error "другой экземпляр awgsplit занят — пропускаю"; return 1; }
+	local rc=0
+	if [ -f "$STATE_DIR/started" ]; then start_internal; rc=$?; fi
+	lock_release
+	return $rc
+}
+
+# Лёгкая проверка: маршруты, endpoint'ы, резолверы, DNS. Вызывается только под блокировкой.
+# Если таблицу nft снесли (перезапуск firewall) — полная пересборка.
+light_sync() {
+	# служба остановлена, пока мы ждали блокировку — ничего не поднимаем
+	[ -f "$STATE_DIR/started" ] || return 0
+	collect_tunnels
+	if ! nft list table inet $T >/dev/null 2>&1 || [ ! -f "$STATE_DIR/nft.rules" ]; then
+		log warn "таблица nft пропала (перезапуск firewall?) — пересобираю"
+		start_internal
+		return
+	fi
+	# у туннеля сменился MTU (или устройство) — правила MSS надо пересобрать
+	if [ "$(mss_spec)" != "$(cat "$STATE_DIR/mss" 2>/dev/null)" ]; then
+		log info "изменился MTU туннеля — пересобираю правила"
+		start_internal
+		return
+	fi
+	collect_endpoints
+	collect_resolvers
+	{
+		echo "flush set inet $T endpoints4"; ip4_only "$STATE_DIR/endpoints4" | elems endpoints4
+		echo "flush set inet $T resolvers4"; ip4_only "$STATE_DIR/resolvers4" | elems resolvers4
+	} > "$STATE_DIR/nft.refresh"
+	nft -f "$STATE_DIR/nft.refresh" 2>/dev/null || log warn "не смог обновить сеты endpoint'ов и резолверов"
+	sync_routes "$HEALTHCHECK"
+	if [ "$ROUTE_CHANGED" = 1 ]; then dns_refresh; else dns_dev_check; fi
+}
+
+# Вызывается procd при событиях интерфейсов
+cmd_routes() {
+	config_load "$CONF"; load_global
+	[ "$ENABLED" = 1 ] && [ -f "$STATE_DIR/started" ] || return 0
+	lock_acquire 30 || return 0
+	QUIET=1
+	light_sync
+	lock_release
+}
+
+cmd_healthcheck() {
+	config_load "$CONF"; load_global
+	[ "$ENABLED" = 1 ] || return 0
+	[ -f "$STATE_DIR/started" ] || return 0
+	if lock_acquire 0; then
+		QUIET=1
+		light_sync
+		lock_release
+	fi
+	autoupdate_check
+}
+
+fetch_list() { # name url kind(domains|net4)
+	local name="$1" url="$2" kind="$3" out="$LISTS_DIR/$1.lst" tmp flt n
+	tmp=$(mktemp /tmp/awgsplit-dl.XXXXXX) || return 1
+	flt="$tmp.f"
+	if wget -q -T 20 -O "$tmp" "$url" 2>/dev/null && [ -s "$tmp" ]; then
+		if [ "$kind" = net4 ]; then
+			tr -d '\r' < "$tmp" | sed 's/#.*//; s/[[:space:]]//g' \
+				| grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' | awk '!s[$0]++' > "$flt"
+		else
+			tr -d '\r' < "$tmp" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+				| grep -E '^[A-Za-z0-9*._-]+$' | grep '\.' | awk '!s[$0]++' > "$flt"
+		fi
+		n=$(nlines "$flt")
+		if [ "$n" -gt 0 ]; then
+			mv -f "$flt" "$out"; rm -f "$tmp"
+			if [ "$kind" = net4 ]; then log info "список '$name': $n подсетей"; else log info "список '$name': $n доменов"; fi
+			return 0
+		fi
+		log warn "список '$name' скачан, но пуст или не распознан — оставляю прежнюю копию"
+	fi
+	rm -f "$tmp" "$flt"
+	if [ -s "$out" ]; then
+		log warn "список '$name' не скачался — использую сохранённую копию"
+	else
+		log error "список '$name' не скачался, сохранённой копии нет"
+	fi
+	return 1
+}
+
+cmd_update() {
+	mkdir -p "$LISTS_DIR"
+	_lock "$FETCHLOCK" 0 || { log info "загрузка списков уже идёт"; return 0; }
+	FLOCKED=1
+	config_load "$CONF"; load_global
+	QUIET=1; collect_tunnels
+	date +%s > "$LISTS_DIR/.last_attempt"
+
+	local t lists l url wanted="" failed="" ok=0
+	for t in $TUNNELS; do
+		config_get lists "$t" community_lists ''
+		for l in $lists; do case " $wanted " in *" $l "*) ;; *) wanted="$wanted $l" ;; esac; done
+	done
+	echo "$wanted" | tr ' ' '\n' | grep . > "$LISTS_DIR/.last_attempt_lists"
+	for l in $wanted; do
+		url=$(list_url "$l")
+		# неизвестное имя качать бессмысленно — это ошибка настройки, её показывает статус
+		[ -n "$url" ] || { log warn "неизвестный список '$l' — пропускаю"; continue; }
+		if fetch_list "$l" "$url" domains; then ok=1; else failed="$failed $l"; fi
+		url=$(list_net4_url "$l")
+		if [ -n "$url" ]; then
+			if fetch_list "$l.net4" "$url" net4; then ok=1; else failed="$failed $l(подсети)"; fi
+		fi
+	done
+	if [ "$ok" = 1 ] || [ -z "$wanted" ]; then date +%s > "$LISTS_DIR/.last_update"; fi
+	echo "$failed" > "$LISTS_DIR/.failed"
+	rm -rf "$FETCHLOCK"; FLOCKED=0
+
+	if [ -n "$failed" ]; then log warn "не обновились списки:$failed"; else log info "списки обновлены"; fi
+
+	# применяем, только если служба запущена (проверка повторяется под блокировкой)
+	if [ -f "$STATE_DIR/started" ]; then
+		AWGSPLIT_NO_AUTOFETCH=1
+		cmd_apply
+	fi
+	[ -z "$failed" ]
+}
+
+cmd_status() {
+	. /usr/share/libubox/jshn.sh
+	config_load "$CONF"; load_global
+	QUIET=1; collect_tunnels
+	local running=0 lu t dns n errf
+	[ -f "$STATE_DIR/started" ] && nft list table inet $T >/dev/null 2>&1 && running=1
+	lu=$(num "$(cat "$LISTS_DIR/.last_update" 2>/dev/null)")
+	json_init
+	json_add_boolean enabled "$ENABLED"
+	json_add_boolean running "$running"
+	if dns_ok; then json_add_boolean dns_ok 1; else json_add_boolean dns_ok 0; fi
+	json_add_int last_update "$lu"
+	json_add_string failed_lists "$(cat "$LISTS_DIR/.failed" 2>/dev/null)"
+	json_add_string dnsmasq_file "$(cat "$STATE_DIR/dnsmasq_file" 2>/dev/null)"
+	json_add_int bad_domains "$(num "$(cat "$STATE_DIR/domain_bad" 2>/dev/null)")"
+	json_add_array errors
+	errf=$(mktemp /tmp/awgsplit-status.XXXXXX)
+	{ printf '%s' "$CFG_ERRORS"; cat "$STATE_DIR/errors" 2>/dev/null; } | awk 'NF && !s[$0]++' > "$errf"
+	while IFS= read -r n; do json_add_string "" "$n"; done < "$errf"
+	rm -f "$errf"
+	json_close_array
+	json_add_array tunnels
+	for t in $TUNNELS; do
+		tget "$t"
+		dns=$(tunnel_dns "$t" "$TIF")
+		json_add_object ""
+		json_add_string name "$t"
+		json_add_string label "$TLABEL"
+		json_add_string interface "$TIF"
+		json_add_string device "$TDEV"
+		json_add_string proto "$(uci -q get network."$TIF".proto)"
+		json_add_string mark "$TMARK"
+		json_add_int table "$TTABLE"
+		json_add_int priority "$TPRIO"
+		json_add_string fallback "$TFB"
+		json_add_string state "$(cat "$STATE_DIR/$t.health" 2>/dev/null)"
+		n=$(cat "$STATE_DIR/$t.hsage" 2>/dev/null)
+		case "$n" in -1) ;; ''|*[!0-9]*) n=-1 ;; esac
+		json_add_int handshake_age "$n"
+		json_add_string route "$(cat "$STATE_DIR/$t.route" 2>/dev/null)"
+		json_add_int domains "$(nlines "$STATE_DIR/$t.domains")"
+		json_add_int ips "$(( $(num "$(set_count "${t}_uip4")") + $(num "$(set_count "${t}_ip4")") ))"
+		json_add_int subnets "$(( $(num "$(set_count "${t}_unet4")") + $(num "$(set_count "${t}_net4")") + $(num "$(set_count "${t}_dsc4")") ))"
+		json_add_string dns "${dns% }"
+		json_add_string missing_lists "$(tr '\n' ' ' < "$STATE_DIR/$t.missing" 2>/dev/null)"
+		json_close_object
+	done
+	json_close_array
+	json_dump
+}
+
+# содержимое сета, не больше 40 строк (сеты из DNS растут до тысяч адресов)
+dump_set() { # set заголовок
+	local n
+	n=$(num "$(set_count "$1")")
+	echo "=== $1 — $2: $n ==="
+	nft list set inet $T "$1" 2>&1 | sed -n '/elements = {/,/}/p' | head -n 40
+	[ "$n" -gt 80 ] && echo "   … показано начало, всего $n"
+	echo
+}
+
+cmd_dump() {
+	local t="$1" m tb cli
+	valid_name "$t" || { echo "Неверное имя туннеля"; return 1; }
+	config_load "$CONF"
+	dump_set "${t}_uip4" "IP своих доменов"
+	dump_set "${t}_ip4"  "IP доменов из готовых списков"
+	dump_set "${t}_unet4" "свои подсети"
+	dump_set "${t}_net4" "подсети из готовых списков"
+	dump_set "${t}_dsc4" "подсети Discord (только голосовой UDP)"
+	m=$(cat "$STATE_DIR/$t.mark" 2>/dev/null)
+	tb=$(cat "$STATE_DIR/$t.table" 2>/dev/null)
+	if [ -z "$m" ]; then
+		echo "Туннель не запущен (выключен, не прошёл проверку или служба остановлена)."
+		return 0
+	fi
+	echo "=== ip rule ==="
+	ip rule show | grep -i "fwmark $m " || echo "правило не найдено"
+	ip -6 rule show 2>/dev/null | grep -i "fwmark $m "
+	echo
+	echo "=== таблица $tb ==="
+	ip route show table "$tb" 2>&1 | grep . || echo "пусто — трафик туннеля идёт напрямую"
+	echo
+	echo "=== состояние ==="
+	echo "связь:      $(cat "$STATE_DIR/$t.health" 2>/dev/null)"
+	echo "handshake:  $(cat "$STATE_DIR/$t.hsage" 2>/dev/null) с назад (-1 = не было)"
+	echo "маршрут:    $(cat "$STATE_DIR/$t.route" 2>/dev/null)"
+	tget "$t"
+	cli=$(awg_cli_for "$(uci -q get network."$TIF".proto)")
+	if [ -n "$cli" ]; then
+		echo
+		echo "=== ${cli##*/} show $TDEV ==="
+		"$cli" show "$TDEV" 2>&1 | grep -viE 'private key|preshared key|header.protection'
+	fi
+	return 0
+}
+
+usage() {
+	cat <<EOF
+awgsplit — раздельная маршрутизация через AmneziaWG
+
+Команды:
+  start          запустить или применить изменения (IP из DNS в сетах сохраняются)
+  reload         то же, что start
+  apply          применить изменения, только если служба уже запущена
+  stop           остановить и убрать всё (правила, таблицу nft, конфиг dnsmasq)
+  restart        stop + start (сеты очищаются)
+  update         скачать списки доменов и подсетей, затем применить
+  routes         пересчитать маршруты (вызывается при событиях интерфейсов)
+  healthcheck    проверить туннели, переключить на запасной или напрямую
+  status         состояние в JSON (для LuCI)
+  dump <туннель> что лежит в сетах, правилах и таблице
+EOF
+}
+
+case "$1" in
+	start|reload) cmd_start ;;
+	apply)        cmd_apply ;;
+	stop)         cmd_stop ;;
+	restart)      cmd_restart ;;
+	update)       cmd_update ;;
+	routes)       cmd_routes ;;
+	healthcheck)  cmd_healthcheck ;;
+	status)       cmd_status ;;
+	dump)         cmd_dump "$2" ;;
+	*)            usage; exit 1 ;;
+esac

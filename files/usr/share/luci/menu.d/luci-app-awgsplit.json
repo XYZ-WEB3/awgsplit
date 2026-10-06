@@ -1,0 +1,49 @@
+{
+	"admin/services/awgsplit": {
+		"title": "AWG Split",
+		"order": 30,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-awgsplit" ],
+			"uci": { "awgsplit": true }
+		}
+	},
+
+	"admin/services/awgsplit/overview": {
+		"title": "Обзор",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "awgsplit/overview"
+		}
+	},
+
+	"admin/services/awgsplit/tunnels": {
+		"title": "Туннели и списки",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "awgsplit/tunnels"
+		}
+	},
+
+	"admin/services/awgsplit/import": {
+		"title": "Импорт конфига",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "awgsplit/import"
+		}
+	},
+
+	"admin/services/awgsplit/diag": {
+		"title": "Диагностика",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "awgsplit/diag"
+		}
+	}
+}

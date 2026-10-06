@@ -1,0 +1,129 @@
+#!/bin/sh
+# rpcd-бэкенд для luci-app-awgsplit
+
+. /usr/share/libubox/jshn.sh
+
+BIN=/usr/bin/awgsplit
+
+valid_name() {
+	case "$1" in ''|[!A-Za-z]*|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ ${#1} -le "$2" ]
+}
+
+reply() { # key value
+	json_init
+	json_add_string "$1" "$2"
+	json_dump
+}
+
+case "$1" in
+	list)
+		cat <<EOF
+{
+  "status": {},
+  "update": {},
+  "restart": {},
+  "dump": { "tunnel": "str" },
+  "interfaces": {},
+  "import_conf": { "conf": "str", "name": "str" }
+}
+EOF
+	;;
+
+	call)
+		case "$2" in
+			status)
+				$BIN status 2>/dev/null || echo '{"running":false,"tunnels":[],"errors":["awgsplit status не отработал"]}'
+			;;
+
+			update)
+				( $BIN update ) >/dev/null 2>&1 </dev/null &
+				reply result started
+			;;
+
+			restart)
+				# в фоне: перезапуск с dnsmasq может занять дольше таймаута LuCI
+				( /etc/init.d/awgsplit restart ) >/dev/null 2>&1 </dev/null &
+				reply result started
+			;;
+
+			dump)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var tunnel tunnel
+				if ! valid_name "$tunnel" 24; then
+					reply output "Неверное имя туннеля"
+					exit 0
+				fi
+				# jshn передаёт значения через окружение (предел ~128 КБ на строку) — режем с запасом
+				reply output "$($BIN dump "$tunnel" 2>&1 | awk '{ n += length($0) + 1; if (n > 60000) { print "… вывод обрезан"; exit } print }')"
+			;;
+
+			# интерфейсы AmneziaWG/WireGuard для выпадающего списка
+			interfaces)
+				lst=$(mktemp /tmp/awgsplit-ifaces.XXXXXX) || { echo '{"interfaces":[]}'; exit 0; }
+				json_init
+				json_add_array interfaces
+				uci -q show network | awk -v q="'" '
+					/^network\.[^.=]+=interface$/ { split($0, a, /[.=]/); ifc[a[2]] = 1; order[++n] = a[2]; next }
+					{
+						eq = index($0, "="); if (!eq) next
+						k = substr($0, 1, eq - 1); v = substr($0, eq + 1); gsub(q, "", v)
+						m = split(k, b, ".")
+						if (m == 3 && (b[2] in ifc)) {
+							if (b[3] == "proto") proto[b[2]] = v
+							if (b[3] == "awgsplit_dns") dns[b[2]] = v
+						}
+					}
+					END {
+						for (i = 1; i <= n; i++) {
+							s = order[i]; p = proto[s]
+							if (p == "amneziawg" || p == "amneziawg3" || p == "wireguard") print s "\t" p "\t" dns[s]
+						}
+					}' > "$lst"
+				while IFS="$(printf '\t')" read -r name proto dns; do
+					json_add_object
+					json_add_string name "$name"
+					json_add_string proto "$proto"
+					json_add_string dns "$dns"
+					json_close_object
+				done < "$lst"
+				rm -f "$lst"
+				json_close_array
+				json_dump
+			;;
+
+			# разбирает .conf от AmneziaVPN и создаёт интерфейс
+			import_conf)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var conf conf
+				json_get_var name name
+				if ! valid_name "$name" 15; then
+					json_init; json_add_int code 4
+					json_add_string output "Имя интерфейса: латиница, цифры и _, с буквы, до 15 символов (например awg_main)."
+					json_dump; exit 0
+				fi
+				if [ -z "$conf" ] || [ ${#conf} -gt 65536 ]; then
+					json_init; json_add_int code 1
+					json_add_string output "Пустой или слишком большой конфиг."
+					json_dump; exit 0
+				fi
+				umask 077
+				tmp=$(mktemp /tmp/awgimport-in.XXXXXX)
+				printf '%s\n' "$conf" > "$tmp"
+				out=$(/usr/share/awgsplit/import-awg.sh "$tmp" "$name" 2>&1)
+				rc=$?
+				rm -f "$tmp"
+				json_init
+				json_add_int code "$rc"
+				json_add_string output "$out"
+				json_dump
+			;;
+
+			*)
+				echo '{"error":"unknown method"}'
+			;;
+		esac
+	;;
+esac

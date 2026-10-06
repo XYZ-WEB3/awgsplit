@@ -1,0 +1,268 @@
+# awgsplit — AmneziaWG (AWG) для OpenWrt с раздельной маршрутизацией
+
+**Как Podkop, только на AmneziaWG.** Через VPN идут только нужные сайты и сервисы,
+всё остальное — напрямую через провайдера. Работает внутри ядра OpenWrt, без прокси-демонов.
+
+> **English:** awgsplit is a Podkop-style selective routing service for OpenWrt over
+> **AmneziaWG (AWG 1.x–3.x)** kernel tunnels. Domains from community lists
+> ([itdoginfo/allow-domains](https://github.com/itdoginfo/allow-domains)) and your own lists
+> are routed into the tunnel via dnsmasq `nftset` + nftables + policy routing; everything else goes
+> direct. Russian LuCI UI, multiple tunnels with failover, one-command install on OpenWrt 25.12+.
+
+---
+
+## Зачем
+
+- **Весь трафик в VPN заворачивать нельзя:** банки, госуслуги и российские сервисы
+  ломаются или режут доступ с иностранных IP. Нужна раздельная маршрутизация.
+- **Podkop** работает через sing-box и умеет VLESS, Trojan и Hysteria, но не умеет AmneziaWG.
+- **AmneziaWG 3.x** (`HeaderProtectionKey`, `RandomTrailers`, «мусорные» пакеты, случайные
+  таймеры) хорошо проходит через DPI/ТСПУ.
+
+awgsplit соединяет одно с другим. Туннель AmneziaWG поднимает сам OpenWrt через модуль ядра
+`kmod-amneziawg`, а в туннель уходит только то, что есть в ваших списках.
+
+## Возможности
+
+- **Готовые списки, как в Podkop** ([itdoginfo/allow-domains](https://github.com/itdoginfo/allow-domains)):
+  `russia_inside`, YouTube, Telegram, Meta, Twitter/X, Discord, TikTok, Google AI, Cloudflare и
+  другие. Где у сервиса есть свои подсети (Telegram, Meta, Discord…), они подключаются автоматически.
+- **Свои списки доменов и подсетей** — сколько угодно, каждый привязан к своему туннелю.
+- **Несколько туннелей одновременно**, например основной сервер и сервер в другой стране,
+  у каждого свои списки.
+- **Запасной туннель.** Живость туннеля проверяется по handshake. Если туннель упал, его трафик
+  уходит в запасной, а если запасного нет — напрямую, чтобы интернет не пропал.
+- **DNS для доменов из списков идёт внутри туннеля** — провайдер его не видит и не подменяет.
+- **Импорт `.conf` из AmneziaVPN** в веб-интерфейсе. Поддерживаются все поля AWG 1.x–3.x,
+  включая диапазоны таймеров. Всё проверяется до записи, при ошибке настройки роутера не меняются.
+- **Веб-интерфейс LuCI на русском:** обзор, туннели и списки, импорт, диагностика.
+- **Автообновление списков**: по умолчанию раз в 72 часа, недокачанные пробуются снова через 30 минут.
+- **Уживается с прошивкой:** отдельная таблица nftables, fw4 не трогает. Остановка убирает всё за собой.
+
+## Как это работает
+
+```
+устройство спрашивает youtube.com
+        │
+        ▼
+    dnsmasq ── спрашивает DNS сервера через туннель (…@awg_main) ──> IP
+        │
+        └──> кладёт IP в nft-сет main_ip4                  (директива nftset=)
+                    │
+                    ▼
+    nftables: новое соединение к IP из сета → ct mark 0x1001  (одно решение на соединение)
+                    │
+                    ▼
+    ip rule: fwmark 0x1001 → таблица 101 → default dev awg_main → туннель
+```
+
+Всё остальное идёт обычным путём через WAN. Адреса самих VPN-серверов всегда идут мимо туннеля,
+так что петли нет.
+
+## Что нужно
+
+| Что | Комментарий |
+|---|---|
+| Роутер с **OpenWrt 25.12 или новее** | нужен менеджер пакетов `apk`. Проверено на Xiaomi AX3000T (mediatek/filogic) |
+| Сервер **AmneziaWG** и клиентский `.conf` для роутера | например, свой сервер через приложение AmneziaVPN. Каждому роутеру — свой профиль |
+| Интернет на роутере во время установки | ставятся `dnsmasq-full`, AmneziaWG и списки |
+| Около 3 МБ свободного места | плюс пакеты AmneziaWG и dnsmasq-full |
+
+AmneziaWG установщик ставит сам из фида [2Grey/awg-openwrt](https://github.com/2Grey/awg-openwrt).
+Там собраны пакеты под каждую версию и платформу OpenWrt. Если вашей платформы там нет,
+поставьте AmneziaWG вручную (proto `amneziawg` или `amneziawg3`), а awgsplit — с ключом `--no-deps`.
+
+## Установка
+
+### Вариант 1. Одной командой на роутере (рекомендуется)
+
+Зайдите на роутер по SSH (`ssh root@192.168.1.1`) и выполните:
+
+```sh
+wget -O /tmp/awgsplit-online.sh https://raw.githubusercontent.com/XYZ-WEB3/awgsplit/main/install-online.sh && sh /tmp/awgsplit-online.sh
+```
+
+Скрипт скачает awgsplit с GitHub и запустит установщик.
+
+### Вариант 2. С компьютера под Windows
+
+Скачайте репозиторий (Code → Download ZIP), распакуйте и в папке выполните:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy.ps1 -Router 192.168.1.1
+```
+
+Скрипт упакует файлы, зальёт их на роутер по SSH и запустит установщик.
+Нужен встроенный в Windows 10/11 OpenSSH.
+
+### Вариант 3. Вручную
+
+```sh
+# на компьютере
+scp -O -r awgsplit root@192.168.1.1:/tmp/
+# на роутере
+cd /tmp/awgsplit && sh ./install.sh
+```
+
+### Что делает установщик
+
+1. Меняет `dnsmasq` на `dnsmasq-full`, потому что обычный не умеет `nftset`.
+   Пакеты скачиваются заранее, при неудаче dnsmasq откатывается, настройки DHCP/DNS сохраняются.
+2. Ставит AmneziaWG (`kmod-amneziawg`, `amneziawg-tools`, `luci-proto-amneziawg`, русский перевод).
+3. Копирует файлы awgsplit, качает списки, включает автозапуск.
+4. **Если найден работающий Podkop**, awgsplit ставится, но не запускается: вместе они будут
+   мешать друг другу. Установщик подскажет, как выключить Podkop.
+
+> После первой установки AmneziaWG **перезагрузите роутер** (`reboot`), чтобы сеть узнала
+> новый протокол. Установщик об этом напомнит.
+
+## Настройка
+
+Всё делается в веб-интерфейсе: **LuCI → Сервисы → AWG Split**.
+
+1. **Импорт конфига.** Загрузите `.conf` из AmneziaVPN (поделиться подключением → формат
+   AmneziaWG) и укажите имя интерфейса `awg_main`. Импорт создаст интерфейс, пира
+   (с `route_allowed_ips=0`, чтобы в туннель не ушло всё подряд) и firewall-зону `awgsplit`
+   с masquerade. DNS из конфига будет использоваться для доменов из списков.
+2. **Туннели и списки.** Проверьте, что в туннеле «Основной VPN» выбран `awg_main`.
+   Отметьте нужные готовые списки, впишите свои домены и нажмите «Сохранить и применить».
+3. **Обзор.** Связь туннеля должна стать «Работает», а в счётчиках появятся домены и подсети.
+
+Импорт можно сделать и из SSH:
+
+```sh
+/usr/share/awgsplit/import-awg.sh /tmp/router.conf awg_main
+awgsplit start
+```
+
+### Второй туннель (сервер в другой стране)
+
+1. Импортируйте второй `.conf` с именем `awg_second`.
+2. В «Туннели и списки» включите туннель «Второй туннель». Он уже заведён: метка `0x1002`,
+   таблица `102`, запасной — основной туннель.
+3. Впишите домены в «Мой список (второй туннель)» и включите его.
+
+Метки, таблицы и интерфейсы у туннелей должны быть разными, интерфейс не даст сохранить одинаковые.
+
+### Если адрес подходит нескольким туннелям
+
+Правила проверяются по порядку, первое совпадение побеждает:
+
+1. свои подсети;
+2. свои домены;
+3. домены из готовых списков;
+4. подсети из готовых списков.
+
+На одном уровне побеждает туннель с меньшим «Приоритетом». Более точный домен (`api.example.com`)
+всегда главнее общего (`example.com`).
+
+## Готовые списки
+
+| Список | Что внутри |
+|---|---|
+| `russia_inside` | заблокированное в РФ и сервисы, закрывшие доступ из РФ (основной список для роутера в России) |
+| `russia_outside` | российские сервисы, доступные только с российского IP (для роутера за границей) |
+| `youtube`, `telegram`, `meta`, `twitter`, `discord`, `tiktok` | сервисы целиком (у части есть подсети) |
+| `google_ai`, `google_play`, `google_meet` | сервисы Google |
+| `cloudflare`, `cloudfront`, `hetzner`, `ovh`, `digitalocean`, `roblox`, `hdrezka` | сервисы и хостинги |
+| `geoblock`, `block`, `news`, `anime`, `porn`, `hodca` | категории |
+
+Списки берутся из [itdoginfo/allow-domains](https://github.com/itdoginfo/allow-domains) и обновляются автоматически.
+
+## Команды
+
+```sh
+awgsplit start          # запустить / применить настройки
+awgsplit apply          # применить, только если служба уже запущена
+awgsplit restart        # полный перезапуск (сеты IP очищаются)
+awgsplit stop           # остановить и убрать всё (правила, таблицу nft, конфиг dnsmasq)
+awgsplit update         # скачать списки и применить
+awgsplit status         # состояние в JSON
+awgsplit dump main      # что в сетах, правилах, таблице, когда был handshake
+awgsplit healthcheck    # проверить туннели прямо сейчас
+```
+
+## Диагностика
+
+```sh
+logread -e awgsplit                 # логи службы
+awg show                            # состояние AmneziaWG
+nft list table inet awgsplit        # все сеты и правила
+ip rule show                        # правила маршрутизации
+ip route show table 101             # таблица туннеля main
+```
+
+### Частые проблемы
+
+**Сайты из списков не идут через VPN**
+- Устройство должно спрашивать DNS у роутера. DoH в Firefox и iCloud Private Relay awgsplit
+  выключает сам. «Безопасный DNS» в Chrome и свои DNS в настройках устройства выключите вручную.
+- После добавления домена устройство может ещё несколько минут ходить по старому адресу,
+  пока у него не истечёт кэш DNS.
+
+**Медленная отдача (upload) с Windows-компьютеров, а с телефонов и самого роутера нормально**
+
+Причина в размере пакетов. RandomTrailers добивает пакеты AmneziaWG случайным «хвостом» до
+самого большого пакета, который туннель уже видел. Если у сервера MTU больше, чем у клиентов
+(у self-hosted AmneziaVPN по умолчанию 1420, а у клиентов 1376), пакеты вырастают почти до
+1500 байт. На некоторых путях такие пакеты режутся на фрагменты и приходят не по порядку.
+Linux, Android и iOS это переносят, а TCP в Windows считает это потерями и резко сбрасывает скорость.
+
+Решение — одинаковый MTU у сервера и клиентов: например, 1376 на сервере, как у клиентов,
+или 1280 везде для запаса. Для self-hosted AmneziaVPN добавьте `MTU = 1376` в секцию
+`[Interface]` файла `/opt/amnezia/awg/awg0.conf` внутри контейнера `amnezia-awg2`
+и перезапустите интерфейс. MTU на роутере меняется повторным импортом `.conf` с нужным `MTU`.
+
+**Туннель «Нет связи»**
+- `awg show` должен показывать свежий `latest handshake`.
+- Проверьте, что UDP-порт сервера открыт, в том числе в облачном файрволе (security group) хостера.
+- Каждому устройству нужен свой профиль: один и тот же `.conf` на двух устройствах
+  приводит к тому, что они выбивают друг друга.
+
+**`wget` на роутере ругается на сертификат** — проверьте дату на роутере (`date`).
+При неверном времени HTTPS не работает.
+
+## Обновление прошивки (sysupgrade)
+
+`/etc/config/awgsplit` сохраняется при sysupgrade. Пакеты и файлы awgsplit после прошивки
+нужно поставить заново — той же командой установки. Строку фида AmneziaWG под новую версию
+OpenWrt установщик пропишет сам.
+
+## Удаление
+
+```sh
+/etc/init.d/awgsplit stop
+/etc/init.d/awgsplit disable
+rm -f /usr/bin/awgsplit /etc/init.d/awgsplit /etc/config/awgsplit
+rm -rf /usr/share/awgsplit /www/luci-static/resources/view/awgsplit
+rm -f /usr/libexec/rpcd/luci.awgsplit
+rm -f /usr/share/rpcd/acl.d/luci-app-awgsplit.json /usr/share/luci/menu.d/luci-app-awgsplit.json
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+/etc/init.d/rpcd restart
+```
+
+`stop` сам убирает правила, таблицу nftables и конфиг dnsmasq. Интерфейсы AmneziaWG и
+firewall-зона `awgsplit` остаются — удалите их в LuCI, если они больше не нужны.
+
+## Файлы
+
+```
+/usr/bin/awgsplit                         основной скрипт
+/etc/init.d/awgsplit                      служба procd: запуск, мониторинг, реакция на интерфейсы
+/etc/config/awgsplit                      настройки
+/usr/share/awgsplit/import-awg.sh         импорт .conf
+/usr/share/awgsplit/lists/                скачанные списки
+/usr/libexec/rpcd/luci.awgsplit           бэкенд для LuCI
+/www/luci-static/resources/view/awgsplit  веб-интерфейс
+```
+
+## Благодарности
+
+- [itdoginfo/allow-domains](https://github.com/itdoginfo/allow-domains) — списки доменов и подсетей
+- [2Grey/awg-openwrt](https://github.com/2Grey/awg-openwrt) — пакеты AmneziaWG для OpenWrt
+- [AmneziaVPN](https://github.com/amnezia-vpn) — протокол AmneziaWG
+- [Podkop](https://github.com/itdoginfo/podkop) — идея и подход к раздельной маршрутизации
+
+## Лицензия
+
+[MIT](LICENSE)

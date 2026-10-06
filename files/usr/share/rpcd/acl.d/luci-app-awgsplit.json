@@ -1,0 +1,17 @@
+{
+	"luci-app-awgsplit": {
+		"description": "Доступ к awgsplit",
+		"read": {
+			"ubus": {
+				"luci.awgsplit": [ "status", "dump", "interfaces" ]
+			},
+			"uci": [ "awgsplit", "network" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.awgsplit": [ "update", "restart", "import_conf" ]
+			},
+			"uci": [ "awgsplit" ]
+		}
+	}
+}

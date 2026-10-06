@@ -1,0 +1,53 @@
+#!/bin/sh /etc/rc.common
+# awgsplit — procd init
+
+START=94
+STOP=10
+USE_PROCD=1
+
+BIN=/usr/bin/awgsplit
+
+start_service() {
+	local en hcint
+	config_load awgsplit
+	config_get_bool en global enabled 1
+
+	# 1000>&- — не передавать дочерним процессам блокировку procd этого init-скрипта
+	# (иначе фоновая загрузка списков держала бы её и тормозила очередь триггеров procd)
+	$BIN start 1000>&-
+
+	[ "$en" = 1 ] || return 0
+
+	# монитор: живость туннелей, fallback, автообновление списков
+	config_get hcint global healthcheck_interval 60
+	case "$hcint" in ''|*[!0-9]*) hcint=60 ;; esac
+	[ "$hcint" -ge 10 ] || hcint=10
+
+	procd_open_instance monitor
+	procd_set_param command /bin/sh -c "while sleep $hcint; do $BIN healthcheck; done"
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+stop_service() {
+	$BIN stop 1000>&-
+}
+
+reload_service() {
+	start
+}
+
+add_iface_trigger() {
+	local ifc
+	config_get ifc "$1" interface ''
+	case "$ifc" in ''|*[!A-Za-z0-9_]*) return 0 ;; esac
+	procd_add_interface_trigger "interface.*" "$ifc" $BIN routes
+}
+
+service_triggers() {
+	procd_add_reload_trigger "awgsplit"
+	config_load awgsplit
+	config_foreach add_iface_trigger tunnel
+	# WAN сменился — могли поменяться резолверы и адреса endpoint'ов
+	procd_add_interface_trigger "interface.*" wan $BIN routes
+}

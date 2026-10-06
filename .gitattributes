@@ -1,0 +1,4 @@
+# роутерные скрипты должны оставаться с LF, иначе BusyBox их не выполнит
+* text=auto eol=lf
+*.ps1 text eol=crlf
+backup/ export-ignore

@@ -1,0 +1,91 @@
+# awgsplit — раздельная маршрутизация через AmneziaWG
+# Документация: /usr/share/awgsplit/README
+#
+# Механика: dnsmasq резолвит домен -> кладёт IP в nftset -> nftables ставит
+# метку соединению -> ip rule отправляет в отдельную таблицу маршрутизации ->
+# туннель. Всё на уровне ядра, без userspace-прокси.
+
+config awgsplit 'global'
+	option enabled '1'
+	# Как часто обновлять списки доменов (в часах)
+	option update_interval '72'
+	# Проверять живость туннелей и переключаться на запасной
+	option healthcheck '1'
+	option healthcheck_interval '60'
+	option log_level 'info'
+	# Выключить DoH в Firefox и iCloud Private Relay (иначе DNS идёт мимо роутера)
+	option block_doh_canary '1'
+	# Откуда брать клиентов (устройства LAN)
+	list lan_ifaces 'br-lan'
+
+# ----------------------------------------------------------------------------
+# ТУННЕЛЬ 1 — основной VPN
+# ----------------------------------------------------------------------------
+config tunnel 'main'
+	option enabled '1'
+	option label 'Основной VPN'
+	# Имя интерфейса OpenWrt (создаётся импортом .conf), до 15 символов
+	option interface 'awg_main'
+	# Метка, таблица (1..252) и приоритет (91..32765) — уникальны для каждого туннеля
+	option fwmark '0x1001'
+	option table '101'
+	option priority '101'
+	# Запасной туннель, если этот упадёт (пусто = трафик пойдёт напрямую)
+	option fallback ''
+	# DNS внутри туннеля для доменов из списков. Импорт .conf заполняет сам
+	# (у серверов Amnezia это 172.29.172.254). Пусто — DNS провайдера.
+	# list dns '172.29.172.254'
+
+	# Готовые списки сообщества (itdoginfo/allow-domains)
+	list community_lists 'russia_inside'
+	list community_lists 'telegram'
+	list community_lists 'meta'
+	list community_lists 'twitter'
+	list community_lists 'discord'
+	list community_lists 'cloudflare'
+	list community_lists 'cloudfront'
+	list community_lists 'google_ai'
+
+	# Свои подсети (CIDR) — пойдут в туннель без участия DNS
+	# list subnets '203.0.113.0/24'
+
+# ----------------------------------------------------------------------------
+# ТУННЕЛЬ 2 — второй сервер (пример, выключен)
+# Импортируйте его .conf с именем интерфейса awg_second и включите туннель.
+# ----------------------------------------------------------------------------
+config tunnel 'second'
+	option enabled '0'
+	option label 'Второй туннель'
+	option interface 'awg_second'
+	option fwmark '0x1002'
+	option table '102'
+	option priority '102'
+	option fallback 'main'
+	# Домены для этого туннеля — в секции 'user_second' ниже.
+	# Порядок при совпадении: свои подсети -> свои домены -> домены готовых
+	# списков -> подсети готовых списков. Поэтому домен из user_second уйдёт
+	# во второй туннель, даже если он есть в russia_inside или сидит на IP
+	# Cloudflare из списков основного туннеля.
+
+# ----------------------------------------------------------------------------
+# Свои списки доменов. Каждая секция привязана к туннелю.
+# Один домен на строку (можно через пробел или запятую), # — комментарий.
+# Поддомены покрываются автоматически: example.com захватит и api.example.com.
+# ----------------------------------------------------------------------------
+config domains 'user_main'
+	option tunnel 'main'
+	option label 'Мой список (основной)'
+	option enabled '1'
+	option domains '# Пример — замените на свои домены
+openai.com
+chatgpt.com
+oaiusercontent.com
+gemini.google.com
+github.com
+githubusercontent.com'
+
+config domains 'user_second'
+	option tunnel 'second'
+	option label 'Мой список (второй туннель)'
+	option enabled '0'
+	option domains ''
