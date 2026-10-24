@@ -15,6 +15,9 @@ config awgsplit 'global'
 	option log_level 'info'
 	# Выключить DoH в Firefox и iCloud Private Relay (иначе DNS идёт мимо роутера)
 	option block_doh_canary '1'
+	# Страница «ВПН упал»: показывается один раз за разрыв связи, окно в секундах
+	option down_page '1'
+	option down_page_secs '300'
 	# Откуда брать клиентов (устройства LAN)
 	list lan_ifaces 'br-lan'
 
@@ -89,3 +92,24 @@ config domains 'user_second'
 	option label 'Мой список (второй туннель)'
 	option enabled '0'
 	option domains ''
+
+# Kill switch: эти сервисы не должны уходить мимо туннеля вообще — если он недоступен,
+# соединение сбрасывается, а не идёт напрямую (вместо того, чтобы тихо утечь провайдеру).
+# Список — пример, замените/дополните под свои сервисы.
+config domains 'killswitch_ai'
+	option tunnel 'main'
+	option label 'Kill switch: Claude, Codex, Google AI'
+	option enabled '1'
+	option killswitch '1'
+	option domains '
+claude.ai
+anthropic.com
+openai.com
+oaiusercontent.com
+chatgpt.com
+chat.openai.com
+gemini.google.com
+aistudio.google.com
+generativelanguage.googleapis.com
+ai.google.dev
+deepmind.google'

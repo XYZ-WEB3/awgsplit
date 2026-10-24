@@ -1,0 +1,31 @@
+#!/bin/sh
+# Публичный (без входа) JSON о живости туннелей — для страницы /awgsplit-down.html.
+# Отдаёт только имена, статус и возраст рукопожатия; ни ключей, ни адресов здесь нет.
+
+D=/var/run/awgsplit
+
+printf 'Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+
+if [ ! -f "$D/started" ]; then
+	printf '{"state":"off","tunnels":[]}\n'
+	exit 0
+fi
+
+esc() { printf '%s' "$1" | tr -d '\000-\037"\\'; }
+
+overall=up
+out=""
+for h in "$D"/*.health; do
+	[ -f "$h" ] || continue
+	t=${h##*/}; t=${t%.health}
+	st=$(cat "$h" 2>/dev/null)
+	rt=$(cat "$D/$t.route" 2>/dev/null)
+	age=$(cat "$D/$t.hsage" 2>/dev/null)
+	case "$age" in -1|[0-9]*) ;; *) age=-1 ;; esac
+	label=$(uci -q get awgsplit."$t".label)
+	# «упал» = трафик туннеля идёт напрямую (запасной туннель тоже считается живым)
+	case "$rt" in direct) overall=down ;; esac
+	out="$out${out:+,}{\"name\":\"$(esc "$t")\",\"label\":\"$(esc "${label:-$t}")\",\"state\":\"$(esc "$st")\",\"route\":\"$(esc "$rt")\",\"hsage\":${age:--1}}"
+done
+
+printf '{"state":"%s","tunnels":[%s]}\n' "$overall" "$out"

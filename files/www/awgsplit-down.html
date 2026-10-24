@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>404 — Барахлит ВПН</title>
+<style>
+:root{
+  --bg1:#0b0f1a; --bg2:#141a2e; --card:#10162a; --line:#25304f;
+  --text:#e8ecf8; --muted:#8b97b8; --bad:#ff5470; --bad2:#ff8a5c; --ok:#34d399; --accent:#7c9cff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
+  color:var(--text);
+  background:
+    radial-gradient(900px 500px at 15% -10%, #2a1d3f55, transparent 60%),
+    radial-gradient(800px 500px at 100% 110%, #1b2f6a44, transparent 60%),
+    linear-gradient(160deg,var(--bg1),var(--bg2));
+  display:flex;align-items:center;justify-content:center;padding:24px;
+  overflow-x:hidden;
+}
+body::before{ /* тонкая сетка */
+  content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:48px 48px;
+  -webkit-mask-image:radial-gradient(ellipse at center,#000 10%,transparent 70%);
+          mask-image:radial-gradient(ellipse at center,#000 10%,transparent 70%);
+}
+.card{
+  position:relative;width:min(640px,100%);
+  background:linear-gradient(180deg,#121a33ee,#0e1428ee);
+  border:1px solid var(--line);border-radius:24px;padding:40px 32px 28px;
+  box-shadow:0 30px 80px #0009, 0 0 0 1px #ffffff08 inset;
+  text-align:center;backdrop-filter:blur(6px);
+}
+.num{
+  font-size:clamp(84px,22vw,148px);font-weight:900;letter-spacing:.04em;line-height:1;
+  background:linear-gradient(180deg,var(--bad),var(--bad2));-webkit-background-clip:text;background-clip:text;color:transparent;
+  position:relative;display:inline-block;
+  filter:drop-shadow(0 8px 30px #ff547055);
+}
+.num::before,.num::after{
+  content:"404";position:absolute;left:0;top:0;width:100%;overflow:hidden;
+  background:inherit;-webkit-background-clip:text;background-clip:text;color:transparent;opacity:.0;
+}
+.bad .num{animation:shake 4s infinite}
+.bad .num::before{opacity:.55;transform:translate(-3px,0);clip-path:inset(0 0 60% 0);animation:glitch1 3.2s infinite steps(1)}
+.bad .num::after{opacity:.55;transform:translate(3px,0);clip-path:inset(55% 0 0 0);animation:glitch2 2.6s infinite steps(1)}
+@keyframes glitch1{0%,92%,100%{transform:translate(0)}93%{transform:translate(-6px,1px)}96%{transform:translate(5px,-1px)}}
+@keyframes glitch2{0%,88%,100%{transform:translate(0)}89%{transform:translate(6px,-1px)}94%{transform:translate(-5px,1px)}}
+@keyframes shake{0%,90%,100%{transform:none}92%{transform:translateX(-2px)}94%{transform:translateX(2px)}96%{transform:translateX(-1px)}}
+
+/* оборванный кабель */
+.wire{margin:6px auto 14px;width:min(420px,100%);height:70px}
+.wire svg{width:100%;height:100%;overflow:visible}
+.cable{fill:none;stroke:#3a4a7a;stroke-width:4;stroke-linecap:round}
+.cable.live{stroke:var(--ok);stroke-dasharray:6 10;animation:flow 1s linear infinite;filter:drop-shadow(0 0 6px #34d39988)}
+.node{fill:#18213f;stroke:#3a4a7a;stroke-width:3}
+.bad .node.r{stroke:var(--bad)}
+.spark{fill:#ffd166;opacity:0}
+.bad .spark{animation:spark 1.6s infinite}
+.bad .spark:nth-of-type(2){animation-delay:.5s}
+.bad .spark:nth-of-type(3){animation-delay:1s}
+@keyframes spark{0%{opacity:0;transform:translate(0,0) scale(.4)}20%{opacity:1}100%{opacity:0;transform:translate(var(--dx,8px),var(--dy,-16px)) scale(1)}}
+@keyframes flow{to{stroke-dashoffset:-32}}
+.gap{stroke:var(--bad);stroke-width:3;stroke-linecap:round}
+.bad .gap{animation:blink 1.2s infinite}
+@keyframes blink{50%{opacity:.25}}
+
+h1{font-size:clamp(22px,5vw,30px);font-weight:800;letter-spacing:.01em;margin-bottom:10px}
+.sub{color:var(--muted);line-height:1.55;font-size:15px;max-width:46ch;margin:0 auto 20px}
+
+.chip{
+  display:inline-flex;align-items:center;gap:10px;padding:9px 16px;border-radius:999px;
+  border:1px solid var(--line);background:#0b1124;font-size:14px;color:var(--muted);margin-bottom:22px;
+}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.bad .dot{background:var(--bad);animation:pulse 1.4s infinite}
+.ok .dot{background:var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 #ff547088}70%{box-shadow:0 0 0 12px #ff547000}100%{box-shadow:0 0 0 0 #ff547000}}
+.ok .dot{animation-name:pulseok}
+@keyframes pulseok{0%{box-shadow:0 0 0 0 #34d39988}70%{box-shadow:0 0 0 12px #34d39900}100%{box-shadow:0 0 0 0 #34d39900}}
+
+.tunnels{display:flex;flex-direction:column;gap:8px;margin:0 auto 22px;max-width:460px;text-align:left}
+.t{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:10px 14px;border:1px solid var(--line);border-radius:12px;background:#0b1124;font-size:14px}
+.t b{font-weight:600}
+.t span{color:var(--muted);font-size:13px}
+.t.bad{border-color:#ff547055}.t.bad span{color:var(--bad)}
+.t.ok span{color:var(--ok)}
+
+.joke{min-height:22px;color:var(--accent);font-size:14px;margin-bottom:22px;transition:opacity .4s}
+.btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+button,.btn{
+  appearance:none;border:1px solid var(--line);background:#161f3c;color:var(--text);
+  padding:12px 22px;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;text-decoration:none;
+  transition:transform .1s,background .2s,border-color .2s;
+}
+button:hover,.btn:hover{background:#1d2850;border-color:#3a4a7a}
+button:active{transform:scale(.97)}
+.primary{background:linear-gradient(180deg,#5a78e8,#4663d2);border-color:#6b88ff}
+.primary:hover{background:linear-gradient(180deg,#6a86f0,#5270de)}
+.foot{margin-top:26px;color:#5d6a8f;font-size:12px}
+
+/* состояния */
+.card .when-ok{display:none}
+.card.ok .when-bad{display:none}
+.card.ok .when-ok{display:block}
+.card.ok .num{background:linear-gradient(180deg,#34d399,#5eead4);-webkit-background-clip:text;background-clip:text;filter:drop-shadow(0 8px 30px #34d39955)}
+.card.ok .num::before,.card.ok .num::after{display:none}
+.card.neutral .num{background:linear-gradient(180deg,#7c9cff,#a78bfa);-webkit-background-clip:text;background-clip:text;filter:drop-shadow(0 8px 30px #7c9cff55)}
+.card.neutral .num::before,.card.neutral .num::after{display:none}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<main class="card bad" id="card">
+  <div class="num">404</div>
+
+  <div class="wire" aria-hidden="true">
+    <svg viewBox="0 0 420 70">
+      <circle class="node" cx="34" cy="35" r="20"/>
+      <circle class="node r" cx="386" cy="35" r="20"/>
+      <path class="cable" id="c1" d="M54 35 H170 q10 0 14 -6"/>
+      <path class="cable" id="c2" d="M366 35 H250 q-10 0 -14 6"/>
+      <path class="cable live" id="cok" d="M54 35 H366" style="display:none"/>
+      <line class="gap" x1="190" y1="20" x2="196" y2="50"/>
+      <line class="gap" x1="224" y1="50" x2="230" y2="20"/>
+      <circle class="spark" cx="210" cy="35" r="3" style="--dx:-10px;--dy:-18px"/>
+      <circle class="spark" cx="210" cy="35" r="3" style="--dx:12px;--dy:-14px"/>
+      <circle class="spark" cx="210" cy="35" r="2.5" style="--dx:2px;--dy:-22px"/>
+    </svg>
+  </div>
+
+  <h1 class="when-bad" id="title">Барахлит ВПН, он упал</h1>
+  <h1 class="when-ok">ВПН поднялся, можно жить</h1>
+
+  <p class="sub when-bad" id="sub">Туннель до сервера не отвечает. Страницы и сервисы из списка сейчас идут напрямую или не открываются вовсе.</p>
+  <p class="sub when-ok">Связь с туннелем восстановлена. Обновите страницу, которую вы открывали, — теперь должно открыться.</p>
+
+  <div class="chip"><i class="dot"></i><span id="chip">проверяю связь…</span></div>
+
+  <div class="tunnels" id="tunnels"></div>
+
+  <div class="joke when-bad" id="joke"></div>
+
+  <div class="btns">
+    <button class="primary" id="retry">Проверить снова</button>
+    <button id="back">Назад</button>
+  </div>
+
+  <div class="foot">AWG Split · страница обновляется сама каждые 4 секунды</div>
+</main>
+
+<script>
+(function(){
+  var card=document.getElementById('card'), chip=document.getElementById('chip'),
+      list=document.getElementById('tunnels'), joke=document.getElementById('joke'),
+      cok=document.getElementById('cok'), c1=document.getElementById('c1'), c2=document.getElementById('c2');
+  var gaps=document.querySelectorAll('.gap,.spark');
+  var jokes=[
+    'Уговариваем хомяка в колесе бежать быстрее…',
+    'Звоним провайдеру. Он снова «проводит технические работы».',
+    'ТСПУ опять шалит? Ну конечно, нет, что вы.',
+    'Пинаем туннель. Нежно.',
+    'Ищем рукопожатие. Ладони потные.',
+    'Пакеты ушли за хлебом и пока не вернулись.',
+    'Перезваниваем серверу. Занято.'
+  ];
+  var ji=Math.floor(Math.random()*jokes.length), prev=null;
+
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+  function ago(sec){
+    if(sec==null||sec<0)return 'рукопожатия ещё не было';
+    if(sec<90)return 'рукопожатие '+sec+' с назад';
+    if(sec<5400)return 'рукопожатие '+Math.round(sec/60)+' мин назад';
+    return 'рукопожатие '+Math.round(sec/3600)+' ч назад';
+  }
+  function setMode(m){
+    card.className='card '+m;
+    var ok=m==='ok';
+    document.querySelector('.num').textContent=ok?'200':'404';
+    cok.style.display=ok?'':'none';
+    c1.style.display=c2.style.display=ok?'none':'';
+    for(var i=0;i<gaps.length;i++)gaps[i].style.display=ok?'none':'';
+    document.title=ok?'ВПН снова на связи':(m==='neutral'?'404 — страница не найдена':'404 — Барахлит ВПН');
+  }
+  function render(d){
+    var ts=(d&&d.tunnels)||[], html='';
+    for(var i=0;i<ts.length;i++){
+      var t=ts[i], good=t.route==='tunnel'||String(t.route).indexOf('fallback')===0;
+      html+='<div class="t '+(good?'ok':'bad')+'"><b>'+esc(t.label||t.name)+'</b><span>'+
+        (good?(t.route==='tunnel'?'работает':'идёт через запасной'):(t.state==='nodev'?'интерфейс не поднят':ago(t.hsage)))+'</span></div>';
+    }
+    list.innerHTML=html;
+    if(!d||d.state==='off'){
+      setMode('neutral');
+      document.getElementById('title').textContent='Страница не найдена';
+      document.getElementById('sub').textContent='Такой страницы на роутере нет. Служба AWG Split сейчас выключена, так что с ВПН всё как обычно.';
+      chip.textContent='служба не запущена';return;
+    }
+    if(d.state==='up'){
+      setMode('ok');chip.textContent='туннель работает';
+      if(prev==='down'){setTimeout(function(){if(document.referrer&&history.length>1){history.back()}},2500)}
+    }else{
+      setMode('bad');
+      document.getElementById('title').textContent='Барахлит ВПН, он упал';
+      document.getElementById('sub').textContent='Туннель до сервера не отвечает. Страницы и сервисы из списка сейчас идут напрямую или не открываются вовсе.';
+      chip.textContent='нет связи с туннелем';
+    }
+    prev=d.state;
+  }
+  function tick(){
+    var x=new XMLHttpRequest();
+    x.open('GET','/cgi-bin/awgsplit-state?_='+Date.now(),true);
+    x.timeout=3500;
+    x.onload=function(){try{render(JSON.parse(x.responseText))}catch(e){fail()}};
+    x.onerror=x.ontimeout=fail;
+    x.send();
+  }
+  function fail(){
+    setMode('bad');chip.textContent='роутер молчит (или ВПН, или Wi-Fi)';list.innerHTML='';
+  }
+  function jokeTick(){
+    joke.style.opacity=0;
+    setTimeout(function(){joke.textContent=jokes[ji%jokes.length];ji++;joke.style.opacity=1},300);
+  }
+  document.getElementById('retry').onclick=function(){chip.textContent='проверяю связь…';tick()};
+  document.getElementById('back').onclick=function(){if(history.length>1)history.back();else location.href='/'};
+  tick();setInterval(tick,4000);jokeTick();setInterval(jokeTick,5000);
+})();
+</script>
+</body>
+</html>

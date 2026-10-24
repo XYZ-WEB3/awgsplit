@@ -158,8 +158,15 @@ load_global() {
 	config_get      LAN_IFACES  global lan_ifaces 'br-lan'
 	config_get_bool BLOCK_DOH   global block_doh_canary 1
 	config_get      DNSDIR_OVR  global dnsmasq_dir ''
+	# страница «ВПН упал»: окно в секундах, в течение которого роутер подменяет служебные
+	# проверки интернета (Windows/Android/iOS) — система сама открывает окно со страницей.
+	# Один раз за разрыв: окно закрывается само, снова взводится только после восстановления.
+	config_get_bool DOWN_PAGE   global down_page 1
+	config_get      PORTAL_SECS global down_page_secs 300
 	UPDATE_INT=$(num "$UPDATE_INT" 72)
 	[ "$UPDATE_INT" -ge 1 ] || UPDATE_INT=72
+	PORTAL_SECS=$(num "$PORTAL_SECS" 300)
+	[ "$PORTAL_SECS" -ge 30 ] || PORTAL_SECS=300
 }
 
 tunnel_cb() {
@@ -380,16 +387,21 @@ dns_dev_check() {
 	dnsmasq_restart
 }
 
+# DOM_KS=1 — только списки с kill switch, DOM_KS=0 — остальные. Kill switch обходится первым:
+# если домен есть и в обычном списке, и в «строгом», побеждает строгий.
 domains_cb() {
-	local s="$1" tun en dom
+	local s="$1" tun en dom ks kind=u
 	config_get tun "$s" tunnel ''
 	[ "$tun" = "$DOM_TARGET" ] || return 0
 	config_get_bool en "$s" enabled 1
 	[ "$en" = 1 ] || return 0
+	config_get_bool ks "$s" killswitch 0
+	[ "$ks" = "$DOM_KS" ] || return 0
+	[ "$ks" = 1 ] && kind=k
 	config_get dom "$s" domains ''
 	[ -n "$dom" ] || return 0
-	printf '%s\n' "$dom" | awk -v t="$DOM_TARGET" '
-		{ sub(/#.*/, ""); n = split($0, a, /[ \t\r,;]+/); for (i = 1; i <= n; i++) if (a[i] != "") print t "\tu\t" a[i] }' >> "$DOM_SRC"
+	printf '%s\n' "$dom" | awk -v t="$DOM_TARGET" -v k="$kind" '
+		{ sub(/#.*/, ""); n = split($0, a, /[ \t\r,;]+/); for (i = 1; i <= n; i++) if (a[i] != "") print t "\t" k "\t" a[i] }' >> "$DOM_SRC"
 }
 
 domains_orphans_cb() {
@@ -414,11 +426,77 @@ tunnel_servers() { # tunnel -> "ip@dev ..." ; пусто = обычный DNS п
 	for ip in $(tunnel_dns "$via" "$ifc"); do printf '%s@%s ' "$ip" "$(tunnel_dev "$ifc")"; done
 }
 
+# ------------------------------------------------------------------ страница «ВПН упал»
+#
+# Как это работает (как у провайдера «оплатите интернет»): пока окно открыто, dnsmasq отвечает на
+# служебные проверки интернета Windows/Android/iOS/Firefox адресом самого роутера. Проверка
+# «не прошла», и система сама открывает окно браузера — а на роутере по любому адресу лежит
+# страница /awgsplit-down.html. Окно открывается один раз за разрыв и закрывается само.
+
+PORTAL_HOSTS="connectivitycheck.gstatic.com connectivitycheck.android.com clients3.google.com captive.apple.com www.msftconnecttest.com ipv6.msftconnecttest.com dns.msftncsi.com detectportal.firefox.com connectivity-check.ubuntu.com nmcheck.gnome.org network-test.debian.org"
+
+# адрес роутера в первой LAN
+portal_ip() {
+	local i ip
+	for i in $LAN_IFACES; do
+		case "$i" in *[!A-Za-z0-9_.-]*) continue ;; esac
+		ip=$(ip -4 -o addr show dev "$i" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+		[ -n "$ip" ] && { echo "$ip"; return 0; }
+	done
+	return 1
+}
+
+portal_active() {
+	local until
+	[ "$DOWN_PAGE" = 1 ] && [ -f "$STATE_DIR/portal_until" ] || return 1
+	until=$(num "$(cat "$STATE_DIR/portal_until" 2>/dev/null)")
+	[ "$(date +%s)" -lt "$until" ]
+}
+
+portal_dnsmasq_lines() {
+	local ip h
+	portal_active || return 0
+	ip=$(portal_ip) || return 0
+	for h in $PORTAL_HOSTS; do printf 'address=/%s/%s\n' "$h" "$ip"; done
+}
+
+# Ведёт «разрыв»: начался (туннель идёт напрямую) -> открываем окно; окно истекло -> закрываем;
+# всё восстановилось -> закрываем и ждём следующего разрыва. PORTAL_CHANGED=1 если dnsmasq надо пересобрать.
+portal_update() {
+	local t down=0 now until
+	PORTAL_CHANGED=0
+	now=$(date +%s)
+	for t in $TUNNELS; do
+		[ "$(cat "$STATE_DIR/$t.route" 2>/dev/null)" = direct ] && down=1
+	done
+	if [ "$down" = 1 ]; then
+		if [ ! -f "$STATE_DIR/outage" ]; then
+			echo "$now" > "$STATE_DIR/outage"
+			if [ "$DOWN_PAGE" = 1 ]; then
+				echo $((now + PORTAL_SECS)) > "$STATE_DIR/portal_until"
+				PORTAL_CHANGED=1
+				log warn "туннель недоступен — показываю страницу «ВПН упал» (один раз, на $PORTAL_SECS с)"
+			fi
+		elif [ -f "$STATE_DIR/portal_until" ]; then
+			until=$(num "$(cat "$STATE_DIR/portal_until" 2>/dev/null)")
+			if [ "$now" -ge "$until" ]; then
+				rm -f "$STATE_DIR/portal_until"
+				PORTAL_CHANGED=1
+				log info "окно страницы «ВПН упал» закрыто (повторно показывать не буду до следующего разрыва)"
+			fi
+		fi
+	elif [ -f "$STATE_DIR/outage" ]; then
+		rm -f "$STATE_DIR/outage"
+		if [ -f "$STATE_DIR/portal_until" ]; then rm -f "$STATE_DIR/portal_until"; PORTAL_CHANGED=1; fi
+	fi
+	return 0
+}
+
 # Собирает конфиг dnsmasq во временный файл.
 #   CONF_CHANGED=1  — отличается от текущего
 #   FLUSH_TUNNELS   — туннели, из которых пропали домены (их сеты надо очистить)
 build_dnsmasq_conf() {
-	local t l k s4 s6 lists srv dev out
+	local t l k s4 s6 spec lists srv dev out
 	CONF_CHANGED=0; FLUSH_TUNNELS=""
 	DNSMASQ_TMP=$(mktemp /tmp/awgsplit-dnsmasq.XXXXXX) || return 1
 	DOM_SRC=$(mktemp /tmp/awgsplit-src.XXXXXX) || { rm -f "$DNSMASQ_TMP"; return 1; }
@@ -427,11 +505,14 @@ build_dnsmasq_conf() {
 		# Firefox и iCloud Private Relay иначе ходят в DNS мимо роутера
 		printf 'address=/use-application-dns.net/\naddress=/mask.icloud.com/\naddress=/mask-h2.icloud.com/\n' >> "$DNSMASQ_TMP"
 	fi
+	portal_dnsmasq_lines >> "$DNSMASQ_TMP"
 
 	# Приоритет при совпадении домена: сначала свои списки (туннели по приоритету), потом готовые.
 	# Более конкретный домен (a.example.com) всегда главнее общего (example.com) — так работает dnsmasq.
 	# Свои домены идут в отдельные сеты ${t}_uip*, готовые — в ${t}_ip*: в nft свои проверяются раньше.
-	for t in $TUNNELS; do DOM_TARGET="$t"; config_foreach domains_cb domains; done
+	for DOM_KS in 1 0; do
+		for t in $TUNNELS; do DOM_TARGET="$t"; config_foreach domains_cb domains; done
+	done
 	config_foreach domains_orphans_cb domains
 	for t in $TUNNELS; do
 		config_get lists "$t" community_lists ''
@@ -441,7 +522,7 @@ build_dnsmasq_conf() {
 		done
 	done
 
-	rm -f "$STATE_DIR"/*.domains "$STATE_DIR"/*.udom "$STATE_DIR"/*.cdom
+	rm -f "$STATE_DIR"/*.domains "$STATE_DIR"/*.udom "$STATE_DIR"/*.cdom "$STATE_DIR"/*.kdom
 	awk -F '\t' -v dir="$STATE_DIR" '
 		function norm(d,   n, i, L) {
 			sub(/#.*/, "", d); gsub(/[ \t\r]/, "", d); d = tolower(d)
@@ -482,10 +563,13 @@ build_dnsmasq_conf() {
 		if [ -z "$srv" ] && [ "$(cat "$STATE_DIR/$t.route" 2>/dev/null)" = tunnel ] && [ "$QUIET" != 1 ]; then
 			log warn "туннель '$t': DNS туннеля не задан — домены резолвятся через провайдера (возможна подмена IP)"
 		fi
-		for k in u c; do
+		for k in u k c; do
 			[ -s "$STATE_DIR/$t.${k}dom" ] || continue
-			if [ "$k" = u ]; then s4="${t}_uip4"; s6="${t}_uip6"; else s4="${t}_ip4"; s6="${t}_ip6"; fi
-			awk -v spec="4#inet#$T#$s4,6#inet#$T#$s6" -v srv="$srv" -v maxlen=700 '
+			if [ "$k" = c ]; then s4="${t}_ip4"; s6="${t}_ip6"; else s4="${t}_uip4"; s6="${t}_uip6"; fi
+			spec="4#inet#$T#$s4,6#inet#$T#$s6"
+			# строгие домены дополнительно кладём в сеты kill switch (${t}_ks4/ks6)
+			[ "$k" = k ] && spec="$spec,4#inet#$T#${t}_ks4,6#inet#$T#${t}_ks6"
+			awk -v spec="$spec" -v srv="$srv" -v maxlen=700 '
 				function flush(   n, i, S) {
 					if (b == "") return
 					print "nftset=" b "/" spec
@@ -643,10 +727,10 @@ build_nft_rules() {
 			ip4_only "$STATE_DIR/$s" | elems "$s"
 		done
 		for t in $TUNNELS; do
-			for s in uip4 ip4; do echo "add set inet $T ${t}_$s { type ipv4_addr; }"; done
-			for s in uip6 ip6; do echo "add set inet $T ${t}_$s { type ipv6_addr; }"; done
+			for s in uip4 ip4 ks4; do echo "add set inet $T ${t}_$s { type ipv4_addr; }"; done
+			for s in uip6 ip6 ks6; do echo "add set inet $T ${t}_$s { type ipv6_addr; }"; done
 			case " $FLUSH_TUNNELS " in *" $t "*)
-				for s in uip4 uip6 ip4 ip6; do echo "flush set inet $T ${t}_$s"; done ;;
+				for s in uip4 uip6 ip4 ip6 ks4 ks6; do echo "flush set inet $T ${t}_$s"; done ;;
 			esac
 			for s in unet4 net4 dsc4; do
 				echo "add set inet $T ${t}_$s { type ipv4_addr; flags interval; }"
@@ -705,6 +789,23 @@ build_nft_rules() {
 			echo "add rule inet $T forward oifname \"$d\" tcp flags & (fin | syn | rst) == syn tcp option maxseg size > $m tcp option maxseg size set $m"
 			echo "add rule inet $T forward iifname \"$d\" tcp flags & (fin | syn | rst) == syn tcp option maxseg size > $m tcp option maxseg size set $m"
 		done
+
+		# KILL SWITCH. Адреса «строгих» доменов (IPv4 и IPv6) не должны уходить никуда, кроме
+		# туннеля (или его запасного): если туннель упал и маршрут не туннельный — соединение
+		# сбрасывается (TCP RST / ICMP unreachable, браузер сразу видит ошибку и не зависает).
+		# Правило смотрит на реальный интерфейс выхода, поэтому не зависит от того, успела ли
+		# служба заметить падение, и закрывает также IPv6 в обход туннеля.
+		for t in $TUNNELS; do
+			tget "$t"
+			case "$TDEV" in ''|*[!A-Za-z0-9_.-]*) log warn "kill switch для '$t' пропущен: странное имя устройства '$TDEV'"; continue ;; esac
+			d="\"$TDEV\""
+			if [ -n "$TFB" ]; then
+				x=$(tunnel_dev "$(uci -q get awgsplit."$TFB".interface)")
+				case "$x" in ''|*[!A-Za-z0-9_.-]*) ;; *) d="$d, \"$x\"" ;; esac
+			fi
+			echo "add rule inet $T forward ip daddr @${t}_ks4 oifname != { $d } reject"
+			echo "add rule inet $T forward ip6 daddr @${t}_ks6 oifname != { $d } reject"
+		done
 	} > "$f"
 }
 
@@ -725,7 +826,7 @@ nft_drop_stale_sets() {
 		case "$s" in bypass4|bypass6|endpoints4|resolvers4) continue ;; esac
 		keep=0
 		for t in $TUNNELS; do
-			case "$s" in "${t}_uip4"|"${t}_uip6"|"${t}_ip4"|"${t}_ip6"|"${t}_unet4"|"${t}_net4"|"${t}_dsc4") keep=1 ;; esac
+			case "$s" in "${t}_uip4"|"${t}_uip6"|"${t}_ip4"|"${t}_ip6"|"${t}_ks4"|"${t}_ks6"|"${t}_unet4"|"${t}_net4"|"${t}_dsc4") keep=1 ;; esac
 		done
 		[ "$keep" = 1 ] || nft delete set inet $T "$s" 2>/dev/null
 	done
@@ -735,7 +836,7 @@ nft_drop_stale_sets() {
 nft_flush_dns_sets() {
 	local t s
 	for t in $FLUSH_TUNNELS; do
-		for s in uip4 uip6 ip4 ip6; do nft flush set inet $T "${t}_$s" 2>/dev/null; done
+		for s in uip4 uip6 ip4 ip6 ks4 ks6; do nft flush set inet $T "${t}_$s" 2>/dev/null; done
 	done
 	return 0
 }
@@ -1008,6 +1109,7 @@ start_internal() {
 
 	# маршруты до DNS: серверы для доменов зависят от того, какой туннель жив
 	sync_routes "$HEALTHCHECK"
+	portal_update
 
 	DNS_READY=0; FLUSH_TUNNELS=""; CONF_CHANGED=0
 	old=$(cat "$STATE_DIR/dnsmasq_file" 2>/dev/null)
@@ -1100,7 +1202,8 @@ light_sync() {
 	} > "$STATE_DIR/nft.refresh"
 	nft -f "$STATE_DIR/nft.refresh" 2>/dev/null || log warn "не смог обновить сеты endpoint'ов и резолверов"
 	sync_routes "$HEALTHCHECK"
-	if [ "$ROUTE_CHANGED" = 1 ]; then dns_refresh; else dns_dev_check; fi
+	portal_update
+	if [ "$ROUTE_CHANGED" = 1 ] || [ "$PORTAL_CHANGED" = 1 ]; then dns_refresh; else dns_dev_check; fi
 }
 
 # Вызывается procd при событиях интерфейсов
@@ -1207,6 +1310,10 @@ cmd_status() {
 	json_add_string failed_lists "$(cat "$LISTS_DIR/.failed" 2>/dev/null)"
 	json_add_string dnsmasq_file "$(cat "$STATE_DIR/dnsmasq_file" 2>/dev/null)"
 	json_add_int bad_domains "$(num "$(cat "$STATE_DIR/domain_bad" 2>/dev/null)")"
+	# страница «ВПН упал»: window — окно открыто, shown — уже показывали в этом разрыве, idle — разрыва нет
+	if portal_active; then json_add_string portal window
+	elif [ -f "$STATE_DIR/outage" ]; then json_add_string portal shown
+	else json_add_string portal idle; fi
 	json_add_array errors
 	errf=$(mktemp /tmp/awgsplit-status.XXXXXX)
 	{ printf '%s' "$CFG_ERRORS"; cat "$STATE_DIR/errors" 2>/dev/null; } | awk 'NF && !s[$0]++' > "$errf"
@@ -1233,6 +1340,8 @@ cmd_status() {
 		json_add_int handshake_age "$n"
 		json_add_string route "$(cat "$STATE_DIR/$t.route" 2>/dev/null)"
 		json_add_int domains "$(nlines "$STATE_DIR/$t.domains")"
+		json_add_int killswitch_domains "$(nlines "$STATE_DIR/$t.kdom")"
+		json_add_int killswitch_ips "$(( $(num "$(set_count "${t}_ks4")") + $(num "$(set_count "${t}_ks6")") ))"
 		json_add_int ips "$(( $(num "$(set_count "${t}_uip4")") + $(num "$(set_count "${t}_ip4")") ))"
 		json_add_int subnets "$(( $(num "$(set_count "${t}_unet4")") + $(num "$(set_count "${t}_net4")") + $(num "$(set_count "${t}_dsc4")") ))"
 		json_add_string dns "${dns% }"
@@ -1262,6 +1371,8 @@ cmd_dump() {
 	dump_set "${t}_unet4" "свои подсети"
 	dump_set "${t}_net4" "подсети из готовых списков"
 	dump_set "${t}_dsc4" "подсети Discord (только голосовой UDP)"
+	dump_set "${t}_ks4" "IP kill switch (IPv4)"
+	dump_set "${t}_ks6" "IP kill switch (IPv6)"
 	m=$(cat "$STATE_DIR/$t.mark" 2>/dev/null)
 	tb=$(cat "$STATE_DIR/$t.table" 2>/dev/null)
 	if [ -z "$m" ]; then

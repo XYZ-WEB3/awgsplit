@@ -142,6 +142,14 @@ put 0644 files/usr/share/luci/menu.d/luci-app-awgsplit.json /usr/share/luci/menu
 for f in overview tunnels import diag; do
 	put 0644 "files/www/luci-static/resources/view/awgsplit/$f.js" "/www/luci-static/resources/view/awgsplit/$f.js"
 done
+# страница «Барахлит ВПН, он упал» и её публичная «живость туннелей» (JSON без секретов)
+put 0644 files/www/awgsplit-down.html            /www/awgsplit-down.html
+put 0755 files/www/cgi-bin/awgsplit-state        /www/cgi-bin/awgsplit-state
+# при любом 404 на самом роутере открывается эта страница (если error_page уже кем-то задан — не трогаем)
+if [ -z "$(uci -q get uhttpd.main.error_page)" ]; then
+	uci -q set uhttpd.main.error_page='/awgsplit-down.html' && uci -q commit uhttpd \
+		&& /etc/init.d/uhttpd reload >/dev/null 2>&1 && ok "uhttpd: страница 404 → /awgsplit-down.html"
+fi
 [ -f README.md ] && put 0644 README.md /usr/share/awgsplit/README
 mkdir -p /usr/share/awgsplit/lists
 ok "Файлы скопированы"

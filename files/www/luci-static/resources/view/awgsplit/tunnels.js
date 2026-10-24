@@ -136,6 +136,17 @@ return view.extend({
 		o.default = '1';
 		o.rmempty = false;
 
+		o = s.option(form.Flag, 'down_page', 'Показывать страницу «ВПН упал»',
+			'Когда туннель недоступен, роутер подменяет служебные проверки интернета Windows, Android и iOS — система сама открывает страницу. Один раз за разрыв.');
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'down_page_secs', 'Сколько держать страницу (сек)');
+		o.datatype = 'range(30,3600)';
+		o.default = '300';
+		o.placeholder = '300';
+		o.depends('down_page', '1');
+
 		o = s.option(form.DynamicList, 'lan_ifaces', 'Устройства LAN',
 			'Трафик с каких сетевых устройств заворачивать. Обычно это br-lan.');
 		o.placeholder = 'br-lan';
@@ -279,6 +290,12 @@ return view.extend({
 		o = s.option(form.Value, 'label', 'Название списка');
 		o.placeholder = 'Мой список';
 		o.editable = true;
+
+		o = s.option(form.Flag, 'killswitch', 'Kill switch',
+			'Трафик этих доменов не пропускается мимо туннеля: если туннель недоступен, соединения сбрасываются, а не идут напрямую.');
+		o.editable = true;
+		o.default = '0';
+		o.rmempty = true;
 
 		o = s.option(form.ListValue, 'tunnel', 'В какой туннель');
 		o.value('', '— не назначен —');
