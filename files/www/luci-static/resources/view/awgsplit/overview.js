@@ -86,7 +86,15 @@ function renderStatus(st) {
 		E('table', { 'class': 'table' }, [
 			row('Служба', st.enabled === false ? badge('#7f8c8d', 'Выключена в настройках') :
 				(st.running ? badge('#2ecc71', 'Работает') : badge('#e74c3c', 'Остановлена'))),
-			row('Списки обновлялись', txt(fmtAgo(st.last_update))),
+			row('Режим', st.mode === 'full' ?
+					txt('Полный — всё в туннель «' + (st.full_tunnel || '?') + '», кроме исключений') :
+					txt('Раздельный — в туннель только списки')),
+				row('Исключения (напрямую)', st.mode === 'full' ?
+					txt('доменов: ' + (st.bypass_domains || 0) + ' · IP из DNS: ' + (st.bypass_ips || 0) +
+						' · подсетей: ' + (st.bypass_subnets || 0) +
+						(st.bypass_missing && String(st.bypass_missing).trim() ? ' · не скачаны: ' + st.bypass_missing : '')) :
+					txt('не используются в режиме «Раздельный»')),
+				row('Списки обновлялись', txt(fmtAgo(st.last_update))),
 			row('Не скачались', txt(st.failed_lists && String(st.failed_lists).trim() ? st.failed_lists : 'всё в порядке')),
 			row('Активных туннелей', txt(tunnels.length))
 		])
@@ -178,7 +186,8 @@ return view.extend({
 		return E('div', {}, [
 			E('h2', {}, txt('AWG Split — раздельная маршрутизация')),
 			E('p', { 'style': 'color:#888' },
-				txt('Сайты из списков идут через туннели AmneziaWG, всё остальное — напрямую через провайдера.')),
+				txt('Режим «Раздельный»: сайты из списков идут через туннели AmneziaWG, всё остальное — напрямую через провайдера. ' +
+					'Режим «Полный»: через туннель идёт всё, кроме исключений (российские сервисы). Переключается на вкладке «Туннели и списки».')),
 			box,
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, txt('Как это работает')),

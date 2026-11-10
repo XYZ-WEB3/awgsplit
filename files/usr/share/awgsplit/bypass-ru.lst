@@ -1,0 +1,139 @@
+# Российские сервисы, которые в режиме «Полный» идут НАПРЯМУЮ, мимо туннеля.
+# Один домен на строку, # — комментарий. Поддомены входят автоматически: yandex.net захватит и api.yandex.net.
+# Этот файл — стартовый набор: установщик кладёт его в LuCI (Туннели и списки → Исключения),
+# дальше список правится там.
+
+# --- Вся российская зона целиком (.ru, .su, .рф) ---
+# Заблокированные .ru-сайты из списка russia_inside всё равно останутся в туннеле:
+# готовые списки туннеля проверяются раньше исключений.
+ru
+su
+xn--p1ai
+
+# --- Яндекс ---
+yandex.ru
+ya.ru
+dzen.ru
+kinopoisk.ru
+yandex.com
+yandex.net
+yandex.st
+yandex.by
+yandex.kz
+yandex.uz
+yandex.md
+yandex.az
+yandex.com.am
+yandex.com.ge
+yandex.cloud
+yandexcloud.net
+yastatic.net
+yadi.sk
+ya.cc
+yango.com
+yandex.taxi
+yandex.travel
+
+# --- VK, Одноклассники, Mail.ru ---
+vk.com
+vk.ru
+vk.me
+vk.cc
+vk.company
+vk.design
+vkvideo.ru
+vkuser.net
+userapi.com
+vk-cdn.net
+vk-cdn.me
+cdn-vk.net
+vk-portal.net
+vk-apps.com
+vkgo.app
+vkcache.com
+vkcdnservice.com
+vkuseraudio.net
+vkuseraudio.com
+vkuservideo.net
+vkuservideo.com
+vkuserlive.net
+vkuserlive.com
+vkplay.live
+vkmessenger.com
+mycdn.me
+ok.ru
+okcdn.ru
+mail.ru
+imgsmail.ru
+my.com
+mradx.net
+
+# --- MAX (мессенджер VK) ---
+max.ru
+oneme.ru
+tamtam.chat
+
+# --- AliExpress (Россия) ---
+aliexpress.ru
+aliexpress-media.com
+alicdn.com
+
+# --- Маркетплейсы и магазины ---
+wildberries.ru
+wb.ru
+wbbasket.ru
+wbstatic.net
+wbcontent.net
+paywb.com
+ozon.ru
+ozone.ru
+ozonusercontent.com
+megamarket.ru
+avito.ru
+avito.st
+lamoda.ru
+
+# --- Банки и платежи ---
+sberbank.ru
+sber.ru
+sberbank.com
+tbank.ru
+tinkoff.ru
+tbank-online.com
+alfabank.ru
+alfabank.st
+vtb.ru
+gazprombank.ru
+nspk.ru
+yoomoney.ru
+qiwi.com
+
+# --- Госуслуги и госсайты ---
+gosuslugi.ru
+gu-st.ru
+mos.ru
+nalog.ru
+pochta.ru
+rzd.ru
+
+# --- Видео и музыка ---
+rutube.ru
+ivi.ru
+ivi.tv
+ivicdn.tv
+okko.tv
+kion.ru
+wink.ru
+more.tv
+premier.one
+start.ru
+
+# --- Связь, карты, работа ---
+2gis.ru
+2gis.com
+hh.ru
+mts.ru
+megafon.ru
+beeline.ru
+tele2.ru
+yota.ru

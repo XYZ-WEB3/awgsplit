@@ -136,6 +136,7 @@ put() { # mode src dst — атомарно, без утилиты install (её
 put 0755 files/usr/bin/awgsplit                  /usr/bin/awgsplit
 put 0755 files/etc/init.d/awgsplit               /etc/init.d/awgsplit
 put 0755 files/usr/share/awgsplit/import-awg.sh  /usr/share/awgsplit/import-awg.sh
+put 0644 files/usr/share/awgsplit/bypass-ru.lst  /usr/share/awgsplit/bypass-ru.lst
 put 0755 files/usr/libexec/rpcd/luci.awgsplit    /usr/libexec/rpcd/luci.awgsplit
 put 0644 files/usr/share/rpcd/acl.d/luci-app-awgsplit.json /usr/share/rpcd/acl.d/luci-app-awgsplit.json
 put 0644 files/usr/share/luci/menu.d/luci-app-awgsplit.json /usr/share/luci/menu.d/luci-app-awgsplit.json
@@ -160,6 +161,17 @@ if [ -f /etc/config/awgsplit ]; then
 else
 	put 0644 files/etc/config/awgsplit /etc/config/awgsplit
 	ok "Установлен стартовый /etc/config/awgsplit (ваши домены уже внутри)"
+fi
+
+# Исключения режима «Полный»: стартовый список российских сервисов кладём в настройки один раз.
+# Существующую секцию не трогаем, режим не меняем (по умолчанию «Раздельный»).
+if [ -z "$(uci -q get awgsplit.ru_services)" ] && [ -s /usr/share/awgsplit/bypass-ru.lst ]; then
+	uci -q set awgsplit.ru_services=bypass \
+		&& uci -q set awgsplit.ru_services.enabled='1' \
+		&& uci -q set awgsplit.ru_services.label='Российские сервисы — напрямую' \
+		&& uci -q set awgsplit.ru_services.domains="$(cat /usr/share/awgsplit/bypass-ru.lst)" \
+		&& uci -q commit awgsplit \
+		&& ok "Добавлен список исключений «Российские сервисы» (используется в режиме «Полный»)"
 fi
 
 # настройки переживут sysupgrade (сами файлы после прошивки надо будет поставить заново)

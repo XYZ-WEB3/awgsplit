@@ -38,6 +38,12 @@ var COMMUNITY = [
 	[ 'hodca',          'HODCA' ]
 ];
 
+// Готовые списки, которые имеет смысл отправлять напрямую в режиме «Полный».
+// russia_inside сюда НЕ годится: это заблокированные в РФ сайты, им как раз нужен туннель.
+var BYPASS_COMMUNITY = [
+	[ 'russia_outside', 'Россия снаружи — российские сервисы, закрытые для зарубежных IP (Госуслуги, Озон, Яндекс-CDN и др.)' ]
+];
+
 var RE_SECTION = /^[A-Za-z][A-Za-z0-9_]{0,23}$/;
 var RE_IP4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 
@@ -77,6 +83,22 @@ function normDomain(d) {
 	return d;
 }
 
+function validCidr(value) {
+	if (!value) return true;
+	var p = String(value).split('/');
+	if (p.length > 2 || !RE_IP4.test(p[0])) return 'Нужен IPv4-адрес или подсеть';
+	if (p.length === 2 && !(/^\d{1,2}$/.test(p[1]) && +p[1] <= 32)) return 'Маска подсети 0..32';
+	return true;
+}
+
+function validDomains(section_id, value) {
+	var bad = domainTokens(value).filter(function(t) { return normDomain(t) === null; });
+	if (bad.length)
+		return 'Некорректные записи: ' + bad.slice(0, 3).join(', ') +
+			(bad.length > 3 ? ' и ещё ' + (bad.length - 3) : '');
+	return true;
+}
+
 function domainTokens(text) {
 	var out = [];
 	String(text || '').split(/\n/).forEach(function(line) {
@@ -102,7 +124,8 @@ return view.extend({
 
 		m = new form.Map('awgsplit', 'Туннели и списки',
 			'Каждый туннель — отдельный интерфейс AmneziaWG со своей таблицей маршрутизации. ' +
-			'Домены и подсети из его списков идут в этот туннель, всё остальное — напрямую через провайдера. ' +
+			'В режиме «Раздельный» домены и подсети из его списков идут в этот туннель, всё остальное — напрямую через провайдера. ' +
+			'В режиме «Полный» в туннель идёт всё, кроме исключений (раздел «Исключения» ниже). ' +
 			'Если адрес подходит нескольким туннелям, порядок такой: свои подсети → свои домены → ' +
 			'домены готовых списков → подсети готовых списков; на одном уровне побеждает туннель с меньшим приоритетом. ' +
 			'Более точный домен (api.example.com) всегда главнее общего (example.com).');
@@ -154,6 +177,41 @@ return view.extend({
 			if (!value) return true;
 			return /^[A-Za-z0-9_.-]{1,15}$/.test(value) ? true : 'Неверное имя устройства';
 		};
+
+		o = s.option(form.ListValue, 'mode', 'Режим работы',
+			'«Раздельный» — в туннель идёт только то, что есть в списках туннеля, остальное напрямую. ' +
+			'«Полный» — в туннель идёт всё, кроме исключений: российские сервисы (Яндекс, VK, MAX, Ozon, банки и т.д.) ' +
+			'остаются напрямую. В режиме «Полный» DNS по умолчанию тоже идёт внутри туннеля, а IPv6 вне исключений отключается ' +
+			'(клиенты сразу переходят на IPv4).');
+		o.value('split', 'Раздельный — в туннель только списки');
+		o.value('full', 'Полный — всё в туннель, кроме исключений');
+		o.default = 'split';
+		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'full_tunnel', 'Туннель для всего остального',
+			'Куда уходит весь трафик, не попавший в исключения. Пусто — главный туннель по приоритету.');
+		o.depends('mode', 'full');
+		o.value('', '— главный по приоритету —');
+		uci.sections('awgsplit', 'tunnel', function(sc) {
+			o.value(sc['.name'], sc.label || sc['.name']);
+		});
+
+		o = s.option(form.Flag, 'full_killswitch', 'Kill switch для режима «Полный»',
+			'Если туннель упал, весь трафик, кроме исключений, сбрасывается, а не уходит напрямую через провайдера. ' +
+			'Исключения (российские сервисы) продолжают работать.');
+		o.depends('mode', 'full');
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.MultiValue, 'bypass_lists', 'Готовые списки-исключения',
+			'Идут напрямую в режиме «Полный». Не добавляйте сюда russia_inside — это заблокированные в РФ сайты, им нужен туннель.');
+		o.depends('mode', 'full');
+		BYPASS_COMMUNITY.forEach(function(c) { o.value(c[0], c[1]); });
+
+		o = s.option(form.DynamicList, 'bypass_subnets', 'Подсети-исключения',
+			'IPv4-адрес или подсеть, например 203.0.113.0/24 — идут напрямую в режиме «Полный».');
+		o.depends('mode', 'full');
+		o.validate = function(section_id, value) { return validCidr(value); };
 
 		o = s.option(form.ListValue, 'log_level', 'Подробность логов');
 		o.value('error', 'Только ошибки');
@@ -265,13 +323,7 @@ return view.extend({
 		o = s.option(form.DynamicList, 'subnets', 'Свои подсети',
 			'IPv4-адрес или подсеть, например 203.0.113.0/24 — пойдут в туннель без участия DNS. Главнее всех остальных правил.');
 		o.modalonly = true;
-		o.validate = function(section_id, value) {
-			if (!value) return true;
-			var p = String(value).split('/');
-			if (p.length > 2 || !RE_IP4.test(p[0])) return 'Нужен IPv4-адрес или подсеть';
-			if (p.length === 2 && !(/^\d{1,2}$/.test(p[1]) && +p[1] <= 32)) return 'Маска подсети 0..32';
-			return true;
-		};
+		o.validate = function(section_id, value) { return validCidr(value); };
 
 		// ------------------------------------------------ свои домены
 		s = m.section(form.GridSection, 'domains', 'Свои списки доменов',
@@ -321,13 +373,39 @@ return view.extend({
 		o.wrap = 'off';
 		o.modalonly = true;
 		o.placeholder = 'example.com\nanother.org';
-		o.validate = function(section_id, value) {
-			var bad = domainTokens(value).filter(function(t) { return normDomain(t) === null; });
-			if (bad.length)
-				return 'Некорректные записи: ' + bad.slice(0, 3).join(', ') +
-					(bad.length > 3 ? ' и ещё ' + (bad.length - 3) : '');
-			return true;
+		o.validate = validDomains;
+
+		o = s.option(form.DummyValue, '_count', 'Доменов');
+		o.cfgvalue = function(section_id) {
+			return String(domainTokens(uci.get('awgsplit', section_id, 'domains')).length);
 		};
+
+		// ------------------------------------------------ исключения (режим «Полный»)
+		s = m.section(form.GridSection, 'bypass', 'Исключения: идут напрямую (режим «Полный»)',
+			'В режиме «Полный» эти домены не заворачиваются в туннель и резолвятся через DNS провайдера. ' +
+			'Один домен на строку, # — комментарий; поддомены входят автоматически. Строка «ru» исключает всю зону .ru. ' +
+			'Заблокированные в РФ сайты из готовых списков туннеля (russia_inside) остаются в туннеле, даже если исключена вся зона. ' +
+			'В режиме «Раздельный» эти списки не используются.');
+		s.addremove = true;
+		s.anonymous = false;
+		s.nodescriptions = true;
+		s.addbtntitle = 'Добавить список исключений';
+
+		o = s.option(form.Flag, 'enabled', 'Вкл');
+		o.editable = true;
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'label', 'Название списка');
+		o.placeholder = 'Российские сервисы';
+		o.editable = true;
+
+		o = s.option(form.TextValue, 'domains', 'Домены');
+		o.rows = 20;
+		o.wrap = 'off';
+		o.modalonly = true;
+		o.placeholder = 'yandex.ru\nvk.com';
+		o.validate = validDomains;
 
 		o = s.option(form.DummyValue, '_count', 'Доменов');
 		o.cfgvalue = function(section_id) {
