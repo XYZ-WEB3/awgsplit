@@ -1,0 +1,7 @@
+#!/bin/sh
+# awgsplit: перед удалением пакета — остановить службу и убрать правила, таблицу nft и конфиг dnsmasq
+if [ -x /etc/init.d/awgsplit ]; then
+	/etc/init.d/awgsplit stop >/dev/null 2>&1
+	/etc/init.d/awgsplit disable >/dev/null 2>&1
+fi
+exit 0

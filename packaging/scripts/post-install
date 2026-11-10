@@ -1,0 +1,56 @@
+#!/bin/sh
+# awgsplit: действия после установки и обновления пакета (post-install и post-upgrade — один и тот же файл).
+# Пакет может ставиться из LuCI (Система → Программное обеспечение), то есть из процесса rpcd:
+# rpcd и uhttpd поэтому перезапускаются в фоне с задержкой, иначе установка оборвалась бы на полпути.
+
+BYP=/usr/share/awgsplit/bypass-ru.lst
+
+# первая установка: стартовый конфиг; существующие настройки не трогаем никогда
+[ -f /etc/config/awgsplit ] || cp /usr/share/awgsplit/config.default /etc/config/awgsplit
+
+# список исключений режима «Полный» кладём в настройки один раз, существующий не трогаем
+if [ -z "$(uci -q get awgsplit.ru_services)" ] && [ -s "$BYP" ]; then
+	uci -q set awgsplit.ru_services=bypass \
+		&& uci -q set awgsplit.ru_services.enabled='1' \
+		&& uci -q set awgsplit.ru_services.label='Российские сервисы — напрямую' \
+		&& uci -q set awgsplit.ru_services.domains="$(cat "$BYP")" \
+		&& uci -q commit awgsplit \
+		&& echo "awgsplit: добавлен список исключений «Российские сервисы» (режим «Полный»)"
+fi
+
+# настройки переживут sysupgrade (сами файлы после прошивки надо будет поставить заново)
+grep -qx '/etc/config/awgsplit' /etc/sysupgrade.conf 2>/dev/null || echo '/etc/config/awgsplit' >> /etc/sysupgrade.conf
+
+# при любом 404 на самом роутере открывается страница «ВПН упал» (если error_page уже кем-то задан — не трогаем)
+NEED_UHTTPD=0
+if [ -z "$(uci -q get uhttpd.main.error_page)" ]; then
+	uci -q set uhttpd.main.error_page='/awgsplit-down.html' && uci -q commit uhttpd && NEED_UHTTPD=1
+fi
+
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+
+case " $(dnsmasq --version 2>/dev/null | sed -n 's/^Compile time options: //p') " in
+	*" nftset "*) ;;
+	*) echo "awgsplit: ВНИМАНИЕ: dnsmasq без nftset, домены не заворачиваются. Нужен dnsmasq-full (apk add dnsmasq-full)." ;;
+esac
+
+# Podkop тоже перехватывает DNS и трафик: вместе они мешают друг другу, поэтому рядом с ним не запускаемся
+PODKOP=0
+{ [ -x /etc/init.d/podkop ] && /etc/init.d/podkop enabled 2>/dev/null; } && PODKOP=1
+nft list table inet PodkopTable >/dev/null 2>&1 && PODKOP=1
+if [ "$PODKOP" = 1 ]; then
+	echo "awgsplit: найден работающий Podkop — awgsplit установлен, но НЕ запущен."
+else
+	/etc/init.d/awgsplit enable >/dev/null 2>&1
+	/etc/init.d/awgsplit stop >/dev/null 2>&1
+	/etc/init.d/awgsplit start >/dev/null 2>&1 && echo "awgsplit: служба запущена"
+fi
+
+(
+	sleep 4
+	/etc/init.d/rpcd restart
+	[ "$NEED_UHTTPD" = 1 ] && /etc/init.d/uhttpd reload
+) >/dev/null 2>&1 </dev/null &
+
+echo "awgsplit: готово. Откройте Сервисы → AWG Split (обновите страницу: Ctrl+F5)."
+exit 0

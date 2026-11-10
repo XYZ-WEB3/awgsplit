@@ -137,6 +137,8 @@ put 0755 files/usr/bin/awgsplit                  /usr/bin/awgsplit
 put 0755 files/etc/init.d/awgsplit               /etc/init.d/awgsplit
 put 0755 files/usr/share/awgsplit/import-awg.sh  /usr/share/awgsplit/import-awg.sh
 put 0644 files/usr/share/awgsplit/bypass-ru.lst  /usr/share/awgsplit/bypass-ru.lst
+# ключ подписи пакета: после него обновления ставятся из LuCI по ссылке на .apk
+put 0644 files/etc/apk/keys/awgsplit.rsa.pub     /etc/apk/keys/awgsplit.rsa.pub
 put 0755 files/usr/libexec/rpcd/luci.awgsplit    /usr/libexec/rpcd/luci.awgsplit
 put 0644 files/usr/share/rpcd/acl.d/luci-app-awgsplit.json /usr/share/rpcd/acl.d/luci-app-awgsplit.json
 put 0644 files/usr/share/luci/menu.d/luci-app-awgsplit.json /usr/share/luci/menu.d/luci-app-awgsplit.json

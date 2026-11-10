@@ -5,3 +5,5 @@ backup/
 *.tar.gz
 *.pcap
 __pycache__/
+
+dist/

@@ -1,0 +1,14 @@
+#!/bin/sh
+# awgsplit: после удаления пакета — убрать страницу 404, если она наша, и сбросить кэш LuCI.
+# /etc/config/awgsplit и интерфейсы AmneziaWG остаются: удалите их в LuCI, если они больше не нужны.
+NEED_UHTTPD=0
+if [ "$(uci -q get uhttpd.main.error_page)" = /awgsplit-down.html ]; then
+	uci -q delete uhttpd.main.error_page && uci -q commit uhttpd && NEED_UHTTPD=1
+fi
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+(
+	sleep 4
+	/etc/init.d/rpcd restart
+	[ "$NEED_UHTTPD" = 1 ] && /etc/init.d/uhttpd reload
+) >/dev/null 2>&1 </dev/null &
+exit 0

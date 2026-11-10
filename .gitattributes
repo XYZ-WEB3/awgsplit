@@ -2,3 +2,5 @@
 * text=auto eol=lf
 *.ps1 text eol=crlf
 backup/ export-ignore
+*.apk binary
+*.adb binary
