@@ -115,13 +115,14 @@ cd /tmp/awgsplit && sh ./install.sh
 > имя пакета из репозитория или локальный файл, URL он не открывает. Поэтому подключается репозиторий.
 
 1. **Один раз добавьте ключ подписи на роутер.** Пакеты подписаны, без ключа `apk` откажется их ставить
-   (`UNTRUSTED signature`). Без терминала это делается через **Система → Планировщик (Scheduled Tasks)**:
-   вставьте строку и сохраните. Через минуту ключ скачается, а строка удалит сама себя.
+   (`UNTRUSTED signature`). Откройте **Система → Администрирование → вкладка «Публ. ключи репозиториев»**
+   (Repo Public Keys), вставьте в поле ссылку на ключ и нажмите Enter или «Add key»:
 
    ```
-   * * * * * wget -qO /etc/apk/keys/awgsplit.rsa.pub https://raw.githubusercontent.com/XYZ-WEB3/awgsplit/main/files/etc/apk/keys/awgsplit.rsa.pub && sed -i '/awgsplit.rsa.pub/d' /etc/crontabs/root
+   https://raw.githubusercontent.com/XYZ-WEB3/awgsplit/main/files/etc/apk/keys/awgsplit.rsa.pub
    ```
 
+   Ключ скачивает браузер, на роутере ничего запускать не нужно.
    (Если вы ставили awgsplit через `install.sh` или `install-online.sh`, ключ уже лежит на роутере.)
 2. **Система → Программное обеспечение → «Configure apk»**: в поле `customfeeds.list` добавьте строку
    и сохраните:
