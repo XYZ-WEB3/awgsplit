@@ -64,6 +64,8 @@ config tunnel 'main'
 	list community_lists 'cloudflare'
 	list community_lists 'cloudfront'
 	list community_lists 'google_ai'
+	# TikTok закреплён за этим туннелем (в режиме full он идёт через него, даже если «всё остальное» выбрано во втором)
+	list community_lists 'tiktok'
 
 	# Свои подсети (CIDR) — пойдут в туннель без участия DNS
 	# list subnets '203.0.113.0/24'

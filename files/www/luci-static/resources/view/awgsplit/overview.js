@@ -23,6 +23,127 @@ var callRestart = rpc.declare({
 	expect: { }
 });
 
+var callSetDefault = rpc.declare({
+	object: 'luci.awgsplit',
+	method: 'set_default',
+	params: [ 'mode', 'tunnel' ],
+	expect: { }
+});
+
+var callPages = rpc.declare({
+	object: 'luci.awgsplit',
+	method: 'pages',
+	expect: { }
+});
+
+var callSetPage = rpc.declare({
+	object: 'luci.awgsplit',
+	method: 'set_page',
+	params: [ 'file' ],
+	expect: { }
+});
+
+var callUploadPage = rpc.declare({
+	object: 'luci.awgsplit',
+	method: 'upload_page',
+	params: [ 'name' ],
+	expect: { }
+});
+
+var UPLOAD_PATH = '/tmp/awgsplit-page.upload';
+
+// Карточка «Страница „ВПН упал“»: выбор встроенной или своей HTML-страницы и загрузка своего файла
+function pageCard() {
+	var box = E('div', { 'class': 'cbi-section' });
+
+	function note(msg, kind) {
+		ui.addNotification(null, E('p', {}, txt(msg)), kind || 'info');
+	}
+
+	function build(r) {
+		var pages = Array.isArray(r.pages) ? r.pages : [];
+		var cur = r.current || '/awgsplit-down.html';
+		var sel = E('select', { 'class': 'cbi-input-select', 'style': 'min-width:18em' }, pages.map(function(p) {
+			return E('option', { 'value': p.path, 'selected': p.path === cur ? 'selected' : null }, txt(p.title));
+		}));
+		var preview = E('a', { 'href': cur, 'target': '_blank', 'rel': 'noreferrer' }, txt('Открыть для просмотра'));
+		sel.addEventListener('change', function() { preview.setAttribute('href', sel.value); });
+
+		var apply = E('button', {
+			'class': 'btn cbi-button-action',
+			'click': ui.createHandlerFn(null, function() {
+				return callSetPage(sel.value).then(function(res) {
+					if (res && res.error) throw new Error(res.error);
+					note('Страница выбрана. Веб-сервер перечитает настройки через пару секунд.');
+					return callPages().then(function(nr) { dom.content(box, build(nr)); });
+				}).catch(function(e) { note('Не удалось: ' + e, 'danger'); });
+			})
+		}, txt('Применить'));
+
+		var upload = E('button', {
+			'class': 'btn cbi-button-neutral',
+			'click': ui.createHandlerFn(null, function() {
+				return ui.uploadFile(UPLOAD_PATH).then(function(f) {
+					return callUploadPage(f.name).then(function(res) {
+						if (res && res.error) throw new Error(res.error);
+						note('Файл загружен: ' + res.path + '. Выберите его в списке и нажмите «Применить».');
+						return callPages().then(function(nr) { dom.content(box, build(nr)); });
+					});
+				}).catch(function(e) { note('Не удалось: ' + e, 'danger'); });
+			})
+		}, txt('Загрузить свой HTML…'));
+
+		return [
+			E('h3', {}, txt('Страница «ВПН упал»')),
+			E('p', {}, txt(
+				'Её показывает сам роутер, когда туннель недоступен: роутер подменяет служебные проверки интернета ' +
+				'Windows, Android и iOS, и система сама открывает окно браузера с этой страницей (один раз за разрыв, ' +
+				'время и включение — в «Туннели и списки → Общие настройки»). Эта же страница открывается по любому ' +
+				'несуществующему адресу на самом роутере (404). Когда VPN поднимется, встроенная страница сама ' +
+				'вернёт на прошлую.')),
+			E('table', { 'class': 'table' }, [
+				row('Показывать страницу', [ sel, ' ', apply, ' ', preview ]),
+				row('Свой файл', [ upload, ' ',
+					E('small', { 'style': 'color:#888' }, txt('до 1 МБ, имя латиницей, расширение .html. Хранятся в /www/awgsplit-pages/')) ])
+			]),
+			E('details', {}, [
+				E('summary', {}, txt('Как сделать свою страницу')),
+				E('p', {}, txt(
+					'Это обычный HTML-файл: любой дизайн, свои картинки (data: URI внутри файла) и скрипты. Чтобы страница ' +
+					'знала, жив ли VPN, она запрашивает /cgi-bin/awgsplit-state (открыт без входа, секретов в нём нет) и ' +
+					'получает JSON: {"state":"up|down|off","tunnels":[{"name","label","state","route","hsage"}]}. ' +
+					'state: up — всё работает, down — трафик какого-то туннеля идёт напрямую или заблокирован kill switch, ' +
+					'off — служба выключена. route: tunnel, fallback:<имя> или direct. hsage — секунд с последнего ' +
+					'рукопожатия (−1 — не было). Готовый пример со статусом лежит в списке: example.html — скопируйте ' +
+					'его, измените и загрузите.'))
+			])
+		];
+	}
+
+	callPages().then(function(r) { dom.content(box, build(r || {})); })
+		.catch(function() { dom.content(box, E('p', {}, txt('Не удалось получить список страниц.'))); });
+	return box;
+}
+
+// Переключение режима и/или туннеля «для всего остального» одним нажатием
+function applyDefault(mode, tunnel) {
+	return callSetDefault(mode, tunnel).then(function(r) {
+		if (r && r.error) throw new Error(r.error);
+		ui.addNotification(null, E('p', {}, txt('Переключаю. Применение займёт несколько секунд, открытые соединения переподключатся сами.')), 'info');
+	}).catch(function(e) {
+		ui.addNotification(null, E('p', {}, txt('Не удалось: ' + e)), 'danger');
+	});
+}
+
+function segButton(label, active, mode, tunnel) {
+	if (active)
+		return E('button', { 'class': 'btn cbi-button-positive', 'disabled': 'disabled' }, txt(label));
+	return E('button', {
+		'class': 'btn cbi-button-action',
+		'click': ui.createHandlerFn(null, applyDefault, mode, tunnel)
+	}, txt(label));
+}
+
 var STATE = {
 	up:      [ '#2ecc71', 'Работает' ],
 	pending: [ '#f39c12', 'Подключается' ],
@@ -98,6 +219,30 @@ function renderStatus(st) {
 			row('Не скачались', txt(st.failed_lists && String(st.failed_lists).trim() ? st.failed_lists : 'всё в порядке')),
 			row('Активных туннелей', txt(tunnels.length))
 		])
+	]));
+
+	// быстрое переключение: режим и туннель «для всего остального»
+	var curMode = st.mode === 'full' ? 'full' : 'split';
+	var curTun = st.full_tunnel || st.full_tunnel_cfg || (tunnels[0] && tunnels[0].name) || '';
+	var tunBtns = [];
+	tunnels.forEach(function(t) {
+		if (tunBtns.length) tunBtns.push(' ');
+		tunBtns.push(segButton(t.label || t.name, t.name === curTun, '', t.name));
+	});
+	nodes.push(E('div', { 'class': 'cbi-section' }, [
+		E('h3', {}, txt('Быстрое переключение')),
+		E('table', { 'class': 'table' }, [
+			row('Режим', [
+				segButton('Раздельный: в туннель только списки', curMode === 'split', 'split', ''),
+				' ',
+				segButton('Полный: всё в туннель, кроме исключений', curMode === 'full', 'full', '')
+			]),
+			row('Всё остальное идёт через', tunBtns.length ? tunBtns : txt('нет включённых туннелей'))
+		]),
+		E('p', { 'style': 'color:#888' }, txt(
+			'Выбор туннеля работает в режиме «Полный». Списки, закреплённые за конкретным туннелем ' +
+			'(например, TikTok за основным), идут через свой туннель независимо от этого выбора. ' +
+			'Внутренние адреса (192.168.x.x и др.) и исключения всегда идут напрямую.'))
 	]));
 
 	var rows = tunnels.map(function(t) {
@@ -189,6 +334,7 @@ return view.extend({
 				txt('Режим «Раздельный»: сайты из списков идут через туннели AmneziaWG, всё остальное — напрямую через провайдера. ' +
 					'Режим «Полный»: через туннель идёт всё, кроме исключений (российские сервисы). Переключается на вкладке «Туннели и списки».')),
 			box,
+			pageCard(),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, txt('Как это работает')),
 				E('p', {}, txt(

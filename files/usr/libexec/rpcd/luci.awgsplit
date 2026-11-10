@@ -25,6 +25,10 @@ case "$1" in
   "restart": {},
   "dump": { "tunnel": "str" },
   "interfaces": {},
+  "set_default": { "mode": "str", "tunnel": "str" },
+  "pages": {},
+  "set_page": { "file": "str" },
+  "upload_page": { "name": "str" },
   "import_conf": { "conf": "str", "name": "str" }
 }
 EOF
@@ -45,6 +49,79 @@ EOF
 				# в фоне: перезапуск с dnsmasq может занять дольше таймаута LuCI
 				( /etc/init.d/awgsplit restart ) >/dev/null 2>&1 </dev/null &
 				reply result started
+			;;
+
+			# быстрое переключение со страницы «Обзор»: режим и/или туннель «для всего остального»
+			set_default)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var mode mode
+				json_get_var tunnel tunnel
+				case "$mode" in ''|split|full) ;; *) reply error "Неверный режим"; exit 0 ;; esac
+				if [ -n "$tunnel" ]; then
+					valid_name "$tunnel" 24 && [ "$(uci -q get awgsplit."$tunnel")" = tunnel ] \
+						|| { reply error "Туннель '$tunnel' не найден"; exit 0; }
+					uci -q set awgsplit.global.full_tunnel="$tunnel"
+				fi
+				[ -n "$mode" ] && uci -q set awgsplit.global.mode="$mode"
+				uci -q commit awgsplit
+				# в фоне: применение пересобирает dnsmasq и может занять дольше таймаута LuCI
+				( $BIN start ) >/dev/null 2>&1 </dev/null &
+				reply result started
+			;;
+
+			# страницы «ВПН упал»: встроенная и свои из /www/awgsplit-pages/. Выбранная — это uhttpd.main.error_page
+			pages)
+				json_init
+				json_add_string current "$(uci -q get uhttpd.main.error_page)"
+				json_add_array pages
+				json_add_object
+				json_add_string path /awgsplit-down.html
+				json_add_string title "Встроенная (шутки, сама возвращает на прошлую страницу)"
+				json_close_object
+				for f in /www/awgsplit-pages/*.html; do
+					[ -f "$f" ] || continue
+					n=${f##*/}
+					json_add_object
+					json_add_string path "/awgsplit-pages/$n"
+					json_add_string title "$n"
+					json_close_object
+				done
+				json_close_array
+				json_dump
+			;;
+
+			set_page)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var file file
+				ok=0
+				case "$file" in
+					/awgsplit-down.html) ok=1 ;;
+					/awgsplit-pages/*.html)
+						n=${file#/awgsplit-pages/}
+						case "$n" in ''|.*|*/*|*[!A-Za-z0-9._-]*) ;; *) [ -f "/www$file" ] && ok=1 ;; esac ;;
+				esac
+				[ "$ok" = 1 ] || { reply error "Такой страницы нет"; exit 0; }
+				uci -q set uhttpd.main.error_page="$file" && uci -q commit uhttpd
+				( sleep 2; /etc/init.d/uhttpd reload ) >/dev/null 2>&1 </dev/null &
+				reply result ok
+			;;
+
+			# свой HTML-файл: LuCI загружает его в /tmp/awgsplit-page.upload, здесь он переезжает в /www/awgsplit-pages/
+			upload_page)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var name name
+				src=/tmp/awgsplit-page.upload
+				case "$name" in ''|.*|*/*|*[!A-Za-z0-9._-]*) reply error "Имя файла: латиница, цифры, . _ - и расширение .html"; rm -f "$src"; exit 0 ;; esac
+				case "$name" in *.html) ;; *) reply error "Нужен файл с расширением .html"; rm -f "$src"; exit 0 ;; esac
+				[ -f "$src" ] || { reply error "Файл не загрузился"; exit 0; }
+				if [ "$(wc -c < "$src")" -gt 1048576 ]; then rm -f "$src"; reply error "Файл больше 1 МБ"; exit 0; fi
+				grep -q '<' "$src" || { rm -f "$src"; reply error "Это не HTML"; exit 0; }
+				mkdir -p /www/awgsplit-pages && sed 's/\r$//' "$src" > "/www/awgsplit-pages/$name" && chmod 644 "/www/awgsplit-pages/$name"
+				rm -f "$src"
+				reply path "/awgsplit-pages/$name"
 			;;
 
 			dump)

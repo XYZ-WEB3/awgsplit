@@ -959,10 +959,12 @@ build_nft_rules() {
 			fi
 			echo "add rule inet $T forward ip daddr @${t}_ks4 oifname != { $d } reject"
 			echo "add rule inet $T forward ip6 daddr @${t}_ks6 oifname != { $d } reject"
-			# Режим full: всё, что назначено основному туннелю (метка в ct), тоже не должно уйти мимо него.
+			# Режим full: всё, что назначено туннелю (метка в ct), не должно уйти мимо него. Правило стоит
+			# для КАЖДОГО туннеля: и для «всего остального», и для закреплённых за другим туннелем списков
+			# (например, TikTok за США, когда по умолчанию выбран Казахстан).
 			# Только исходящее из LAN (ct direction original): ответы идут с другой стороны и не трогаются.
 			# Исключения метку не получают, поэтому продолжают ходить напрямую.
-			if [ "$MODE" = full ] && [ "$FULL_KS" = 1 ] && [ "$t" = "$FULL_TUNNEL" ]; then
+			if [ "$MODE" = full ] && [ "$FULL_KS" = 1 ]; then
 				echo "add rule inet $T forward iifname { $lan } ct direction original ct mark $TMARK oifname != { $d } reject"
 			fi
 		done
@@ -1296,6 +1298,14 @@ start_internal() {
 	nft_drop_stale_sets
 	echo "$MSS_SPEC" > "$STATE_DIR/mss"
 
+	# Сменился режим или туннель «для всего остального»: у открытых соединений остался NAT-адрес прежнего
+	# туннеля, по новому пути они бы молча висели. Сбрасываем их — приложения переподключатся сами.
+	cur="$MODE:$FULL_TUNNEL"; old=$(cat "$STATE_DIR/full_applied" 2>/dev/null)
+	case "$old" in
+		full:?*) [ "$old" = "$cur" ] || ct_flush_mark "$(cat "$STATE_DIR/${old#full:}.mark" 2>/dev/null)" ;;
+	esac
+	echo "$cur" > "$STATE_DIR/full_applied"
+
 	[ "$DNS_READY" = 1 ] && dnsmasq_commit
 
 	printf '%s' "$CFG_ERRORS" > "$STATE_DIR/errors"
@@ -1481,6 +1491,7 @@ cmd_status() {
 	json_add_string mode "$MODE"
 	json_add_string full_tunnel "$FULL_TUNNEL"
 	json_add_boolean full_killswitch "$FULL_KS"
+	json_add_string full_tunnel_cfg "$FULL_WANT"
 	json_add_int bypass_domains "$(nlines "$STATE_DIR/$BP.domains")"
 	json_add_int bypass_ips "$(( $(num "$(set_count bp_ip4)") + $(num "$(set_count bp_ip6)") ))"
 	json_add_int bypass_subnets "$(num "$(set_count bp_net4)")"

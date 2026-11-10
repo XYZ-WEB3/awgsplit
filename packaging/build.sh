@@ -1,13 +1,13 @@
 #!/bin/sh
 # Сборка пакета dist/awgsplit.apk. Нужны Docker и закрытый ключ подписи.
-#   sh packaging/build.sh [версия]        например: sh packaging/build.sh 1.1.0
+#   sh packaging/build.sh [версия]        например: sh packaging/build.sh 1.2.0
 # Закрытый ключ лежит ВНЕ репозитория: ~/.awgsplit-signing/awgsplit.rsa (каталог можно сменить
 # переменной AWGSPLIT_KEYDIR). Открытая часть — files/etc/apk/keys/awgsplit.rsa.pub.
 # Новый ключ:
 #   docker run --rm -v ~/.awgsplit-signing:/key alpine:edge sh -c \
 #     'apk add -q openssl && openssl genrsa -out /key/awgsplit.rsa 4096 && openssl rsa -in /key/awgsplit.rsa -pubout -out /key/awgsplit.rsa.pub'
 cd "$(dirname "$0")/.." || exit 1
-VER="${1:-1.1.0}"
+VER="${1:-1.2.0}"
 KEYDIR="${AWGSPLIT_KEYDIR:-$HOME/.awgsplit-signing}"
 [ -f "$KEYDIR/awgsplit.rsa" ] || { echo "Нет ключа $KEYDIR/awgsplit.rsa"; exit 1; }
 HERE=$(pwd -W 2>/dev/null || pwd)

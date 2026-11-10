@@ -4,7 +4,7 @@
 #   /src  — репозиторий (только чтение)     /out — куда положить пакет
 #   /key  — каталог с закрытым ключом awgsplit.rsa (если есть — пакет подписывается)
 set -e
-VERSION="${AWGSPLIT_VERSION:-1.1.0}"
+VERSION="${AWGSPLIT_VERSION:-1.2.0}"
 apk add -q apk-tools >/dev/null
 
 S=/tmp/stage

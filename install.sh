@@ -147,6 +147,8 @@ for f in overview tunnels import diag; do
 done
 # страница «Барахлит ВПН, он упал» и её публичная «живость туннелей» (JSON без секретов)
 put 0644 files/www/awgsplit-down.html            /www/awgsplit-down.html
+put 0644 files/www/awgsplit-pages/example.html   /www/awgsplit-pages/example.html
+grep -qx '/www/awgsplit-pages/' /etc/sysupgrade.conf 2>/dev/null || echo '/www/awgsplit-pages/' >> /etc/sysupgrade.conf
 put 0755 files/www/cgi-bin/awgsplit-state        /www/cgi-bin/awgsplit-state
 # при любом 404 на самом роутере открывается эта страница (если error_page уже кем-то задан — не трогаем)
 if [ -z "$(uci -q get uhttpd.main.error_page)" ]; then

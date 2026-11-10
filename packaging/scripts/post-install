@@ -20,6 +20,7 @@ fi
 
 # настройки переживут sysupgrade (сами файлы после прошивки надо будет поставить заново)
 grep -qx '/etc/config/awgsplit' /etc/sysupgrade.conf 2>/dev/null || echo '/etc/config/awgsplit' >> /etc/sysupgrade.conf
+grep -qx '/www/awgsplit-pages/' /etc/sysupgrade.conf 2>/dev/null || echo '/www/awgsplit-pages/' >> /etc/sysupgrade.conf
 
 # при любом 404 на самом роутере открывается страница «ВПН упал» (если error_page уже кем-то задан — не трогаем)
 NEED_UHTTPD=0
