@@ -178,6 +178,15 @@ if [ -z "$(uci -q get awgsplit.ru_services)" ] && [ -s /usr/share/awgsplit/bypas
 		&& ok "Добавлен список исключений «Российские сервисы» (используется в режиме «Полный»)"
 fi
 
+# Исключения режима «Полный»: добавляем готовые списки один раз (метка bypass_defaults), чтобы после очистки
+# списка пользователем они не возвращались. Скачиваются при запуске службы.
+if [ "$(uci -q get awgsplit.global.bypass_defaults)" != 1 ]; then
+	for l in russia_outside lib4u_ru; do
+		uci -q get awgsplit.global.bypass_lists | tr ' ' '\n' | grep -qx "$l" || uci -q add_list awgsplit.global.bypass_lists="$l"
+	done
+	uci -q set awgsplit.global.bypass_defaults=1 && uci -q commit awgsplit
+fi
+
 # настройки переживут sysupgrade (сами файлы после прошивки надо будет поставить заново)
 grep -qx '/etc/config/awgsplit' /etc/sysupgrade.conf 2>/dev/null || echo '/etc/config/awgsplit' >> /etc/sysupgrade.conf
 

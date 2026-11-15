@@ -26,6 +26,7 @@ case "$1" in
   "dump": { "tunnel": "str" },
   "interfaces": {},
   "set_default": { "mode": "str", "tunnel": "str" },
+  "explain": { "target": "str" },
   "pages": {},
   "set_page": { "file": "str" },
   "upload_page": { "name": "str" },
@@ -122,6 +123,16 @@ EOF
 				mkdir -p /www/awgsplit-pages && sed 's/\r$//' "$src" > "/www/awgsplit-pages/$name" && chmod 644 "/www/awgsplit-pages/$name"
 				rm -f "$src"
 				reply path "/awgsplit-pages/$name"
+			;;
+
+			# куда пойдёт сайт или IP и почему (читает реальные правила роутера)
+			explain)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var target target
+				case "$target" in ''|*[!A-Za-z0-9.:_-]*) reply output "Введите домен (example.ru) или IP-адрес"; exit 0 ;; esac
+				[ ${#target} -le 253 ] || { reply output "Слишком длинное имя"; exit 0; }
+				reply output "$($BIN explain "$target" 2>&1 | awk '{ n += length($0) + 1; if (n > 20000) { print "… вывод обрезан"; exit } print }')"
 			;;
 
 			dump)

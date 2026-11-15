@@ -34,6 +34,9 @@ config awgsplit 'global'
 	# Готовые списки, которые в режиме full идут напрямую. russia_outside — российские сервисы,
 	# закрытые для зарубежных IP. НЕ добавляйте сюда russia_inside: это заблокированные в РФ сайты.
 	list bypass_lists 'russia_outside'
+	list bypass_lists 'lib4u_ru'
+	# метка: стартовые списки исключений уже добавлены (не добавлять повторно после очистки)
+	option bypass_defaults '1'
 	# Свои подсети-исключения (напрямую)
 	# list bypass_subnets '203.0.113.0/24'
 

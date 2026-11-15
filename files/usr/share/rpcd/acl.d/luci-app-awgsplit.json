@@ -3,7 +3,7 @@
 		"description": "Доступ к awgsplit",
 		"read": {
 			"ubus": {
-				"luci.awgsplit": [ "status", "dump", "interfaces", "pages" ]
+				"luci.awgsplit": [ "status", "dump", "interfaces", "pages", "explain" ]
 			},
 			"uci": [ "awgsplit", "network" ]
 		},

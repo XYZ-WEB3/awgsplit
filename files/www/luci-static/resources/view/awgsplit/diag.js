@@ -4,6 +4,13 @@
 'require ui';
 'require uci';
 
+var callExplain = rpc.declare({
+	object: 'luci.awgsplit',
+	method: 'explain',
+	params: [ 'target' ],
+	expect: { }
+});
+
 var callDump = rpc.declare({
 	object: 'luci.awgsplit',
 	method: 'dump',
@@ -33,6 +40,20 @@ return view.extend({
 		});
 	},
 
+	handleExplain: function() {
+		var inp = document.getElementById('awg_explain_target');
+		var out = document.getElementById('awg_explain_out');
+		var target = (inp && inp.value || '').trim().replace(/^https?:\/\//i, '').replace(/[\/?#].*$/, '');
+		if (!target) return;
+
+		out.textContent = 'Проверяю…';
+		return callExplain(target).then(function(res) {
+			out.textContent = (res && res.output) ? res.output : 'Пусто';
+		}).catch(function(e) {
+			out.textContent = 'Ошибка: ' + e;
+		});
+	},
+
 	render: function() {
 		var opts = uci.sections('awgsplit', 'tunnel').map(function(s) {
 			return E('option', { 'value': s['.name'] }, txt((s.label || s['.name']) + ' (' + s['.name'] + ')'));
@@ -42,6 +63,30 @@ return view.extend({
 			E('h2', {}, txt('Диагностика')),
 
 			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, txt('Проверить сайт: куда он пойдёт и почему')),
+				E('p', {}, txt(
+					'Введите домен или IP. Роутер по своим реальным правилам покажет, пойдёт ли адрес в туннель или напрямую, ' +
+					'и в каком списке он нашёлся. Если сайт должен идти напрямую, а идёт в туннель, здесь видна причина.')),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title', 'for': 'awg_explain_target' }, txt('Сайт или IP')),
+					E('div', { 'class': 'cbi-value-field' }, [
+						E('input', {
+							'id': 'awg_explain_target', 'class': 'cbi-input-text', 'type': 'text',
+							'placeholder': 'wotpack.ru', 'style': 'min-width:18em',
+							'keydown': function(ev) { if (ev.keyCode === 13) document.getElementById('awg_explain_btn').click(); }
+						}),
+						' ',
+						E('button', {
+							'id': 'awg_explain_btn', 'class': 'btn cbi-button-action',
+							'click': ui.createHandlerFn(this, 'handleExplain')
+						}, txt('Проверить'))
+					])
+				]),
+				E('pre', { 'id': 'awg_explain_out', 'style': PRE }, txt('Введите сайт и нажмите «Проверить».'))
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, txt('Содержимое сетов и маршрутов')),
 				E('p', {}, txt(
 					'Показывает, что реально лежит в nft-сетах, какие ip rule активны, что в таблице маршрутизации ' +
 					'и когда был последний handshake. Если сет IP пуст — устройства ещё не обращались к доменам из списков ' +
