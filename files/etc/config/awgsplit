@@ -7,6 +7,8 @@
 
 config awgsplit 'global'
 	option enabled '1'
+	# версия схемы настроек (2 = туннели + группы); ставится сама при переводе старых настроек
+	option schema '2'
 	# Как часто обновлять списки доменов (в часах)
 	option update_interval '72'
 	# Проверять живость туннелей и переключаться на запасной
@@ -26,8 +28,8 @@ config awgsplit 'global'
 	#   full  — в туннель идёт ВСЁ, кроме исключений: секций 'bypass' ниже, списков bypass_lists и
 	#           подсетей bypass_subnets. DNS по умолчанию тоже идёт внутри туннеля.
 	option mode 'split'
-	# Какой туннель получает «всё остальное» в режиме full (пусто = главный по приоритету)
-	option full_tunnel ''
+	# Какая ГРУППА получает «всё остальное» в режиме full (пусто = главная по приоритету)
+	option full_group ''
 	# Kill switch режима full: туннель упал — всё, что не в исключениях, сбрасывается, а не идёт напрямую.
 	# Исключения (российские сервисы) продолжают работать напрямую.
 	option full_killswitch '1'
@@ -40,23 +42,57 @@ config awgsplit 'global'
 	# Свои подсети-исключения (напрямую)
 	# list bypass_subnets '203.0.113.0/24'
 
+	# УВЕДОМЛЕНИЯ В TELEGRAM (бот только присылает сообщения о смене туннеля; роутер его не слушает)
+	option tg_enabled '0'
+	# токен бота от @BotFather
+	option tg_token ''
+	# ID пользователей через запятую (свой ID можно узнать у @userinfobot; пользователь должен нажать /start у бота)
+	option tg_chat_ids ''
+	# какие события присылать: switch — переключился на запасной, down — рабочих туннелей не осталось,
+	# up — группа снова работает, back — вернулась на основной
+	option tg_events 'switch down up back'
+	# сколько секунд событие должно продержаться, прежде чем про него сообщать (0 — сразу)
+	option tg_delay '0'
+	option tg_router_name ''
+
 # ----------------------------------------------------------------------------
-# ТУННЕЛЬ 1 — основной VPN
+# ТУННЕЛИ — интерфейсы AmneziaWG (до 10). Создаются импортом .conf в LuCI.
 # ----------------------------------------------------------------------------
-config tunnel 'main'
+config tunnel 't_main'
 	option enabled '1'
 	option label 'Основной VPN'
 	# Имя интерфейса OpenWrt (создаётся импортом .conf), до 15 символов
 	option interface 'awg_main'
-	# Метка, таблица (1..252) и приоритет (91..32765) — уникальны для каждого туннеля
-	option fwmark '0x1001'
-	option table '101'
-	option priority '101'
-	# Запасной туннель, если этот упадёт (пусто = трафик пойдёт напрямую)
-	option fallback ''
 	# DNS внутри туннеля для доменов из списков. Импорт .conf заполняет сам
 	# (у серверов Amnezia это 172.29.172.254). Пусто — DNS провайдера.
 	# list dns '172.29.172.254'
+
+config tunnel 't_second'
+	option enabled '0'
+	option label 'Второй туннель'
+	option interface 'awg_second'
+
+# ----------------------------------------------------------------------------
+# ГРУППЫ (до 10) — единица маршрутизации: упорядоченная цепочка туннелей. Первый — главный, остальные —
+# запасные по приоритету. К группе привязаны списки доменов и подсети ниже.
+# ----------------------------------------------------------------------------
+config group 'main'
+	option enabled '1'
+	option label 'Основная'
+	# Порядок = приоритет: первый туннель главный, дальше запасные
+	list tunnel 't_main'
+	# Возврат на более приоритетный туннель, когда он ожил: auto — сам через failback_delay секунд
+	# стабильной работы, manual — остаться на запасном, пока он не упадёт или вы не переключите вручную
+	option failback 'auto'
+	option failback_delay '120'
+	# Закрепить конкретный туннель вручную (пусто = автоматически по приоритету)
+	option active ''
+	# Если не работает ни один туннель группы: 1 — блокировать её трафик, 0 — пускать напрямую
+	option killswitch '0'
+	# Метка, таблица (1..252) и приоритет (91..32765) — уникальны для каждой группы
+	option fwmark '0x1001'
+	option table '101'
+	option priority '101'
 
 	# Готовые списки сообщества (itdoginfo/allow-domains)
 	list community_lists 'russia_inside'
@@ -67,37 +103,34 @@ config tunnel 'main'
 	list community_lists 'cloudflare'
 	list community_lists 'cloudfront'
 	list community_lists 'google_ai'
-	# TikTok закреплён за этим туннелем (в режиме full он идёт через него, даже если «всё остальное» выбрано во втором)
+	# TikTok закреплён за этой группой (в режиме full он идёт через неё, даже если «всё остальное» выбрано в другой)
 	list community_lists 'tiktok'
 
-	# Свои подсети (CIDR) — пойдут в туннель без участия DNS
+	# Свои подсети (CIDR) — пойдут в группу без участия DNS
 	# list subnets '203.0.113.0/24'
 
-# ----------------------------------------------------------------------------
-# ТУННЕЛЬ 2 — второй сервер (пример, выключен)
-# Импортируйте его .conf с именем интерфейса awg_second и включите туннель.
-# ----------------------------------------------------------------------------
-config tunnel 'second'
+# Вторая группа (пример, выключена): сначала второй сервер, запасным — основной туннель.
+# Импортируйте .conf второго сервера с именем awg_second, включите туннель t_second и эту группу.
+config group 'second'
 	option enabled '0'
-	option label 'Второй туннель'
-	option interface 'awg_second'
+	option label 'Вторая'
+	list tunnel 't_second'
+	list tunnel 't_main'
+	option failback 'auto'
+	option failback_delay '120'
+	option active ''
+	option killswitch '0'
 	option fwmark '0x1002'
 	option table '102'
 	option priority '102'
-	option fallback 'main'
-	# Домены для этого туннеля — в секции 'user_second' ниже.
-	# Порядок при совпадении: свои подсети -> свои домены -> домены готовых
-	# списков -> подсети готовых списков. Поэтому домен из user_second уйдёт
-	# во второй туннель, даже если он есть в russia_inside или сидит на IP
-	# Cloudflare из списков основного туннеля.
 
 # ----------------------------------------------------------------------------
-# Свои списки доменов. Каждая секция привязана к туннелю.
+# Свои списки доменов. Каждая секция привязана к группе (option group).
 # Один домен на строку (можно через пробел или запятую), # — комментарий.
 # Поддомены покрываются автоматически: example.com захватит и api.example.com.
 # ----------------------------------------------------------------------------
 config domains 'user_main'
-	option tunnel 'main'
+	option group 'main'
 	option label 'Мой список (основной)'
 	option enabled '1'
 	option domains '# Пример — замените на свои домены
@@ -109,8 +142,8 @@ github.com
 githubusercontent.com'
 
 config domains 'user_second'
-	option tunnel 'second'
-	option label 'Мой список (второй туннель)'
+	option group 'second'
+	option label 'Мой список (вторая группа)'
 	option enabled '0'
 	option domains ''
 
@@ -118,7 +151,7 @@ config domains 'user_second'
 # соединение сбрасывается, а не идёт напрямую (вместо того, чтобы тихо утечь провайдеру).
 # Список — пример, замените/дополните под свои сервисы.
 config domains 'killswitch_ai'
-	option tunnel 'main'
+	option group 'main'
 	option label 'Kill switch: Claude, Codex, Google AI'
 	option enabled '1'
 	option killswitch '1'

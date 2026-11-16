@@ -1,464 +1,329 @@
 'use strict';
 'require view';
-'require form';
+'require ui';
 'require uci';
-'require rpc';
+'require dom';
+'require poll';
+'require view.awgsplit.common as awg';
 
-var callInterfaces = rpc.declare({
-	object: 'luci.awgsplit',
-	method: 'interfaces',
-	expect: { interfaces: [] }
-});
+var txt = awg.txt;
+var CONF = awg.CONF;
+var RE_IFACE = /^[A-Za-z][A-Za-z0-9_]{0,14}$/;
+var RESERVED = { lan: 1, wan: 1, wan6: 1, loopback: 1, lo: 1, globals: 1, awgsplit: 1 };
 
-// Готовые списки itdoginfo/allow-domains (те же, что в Podkop)
-var COMMUNITY = [
-	[ 'russia_inside',  'Россия внутри — заблокированное в РФ + зарубежные сервисы, блокирующие РФ-IP (для роутера в России)' ],
-	[ 'russia_outside', 'Россия снаружи — российские сервисы, доступные только с РФ-IP (для роутера за границей; в зарубежный туннель не включать)' ],
-	[ 'telegram',       'Telegram (домены + подсети)' ],
-	[ 'meta',           'Meta: Instagram, Facebook, WhatsApp (домены + подсети)' ],
-	[ 'twitter',        'Twitter / X (домены + подсети)' ],
-	[ 'discord',        'Discord (домены + голосовые подсети)' ],
-	[ 'youtube',        'YouTube' ],
-	[ 'tiktok',         'TikTok' ],
-	[ 'google_ai',      'Google AI: Gemini, AI Studio' ],
-	[ 'google_play',    'Google Play' ],
-	[ 'google_meet',    'Google Meet (домены + подсети)' ],
-	[ 'cloudflare',     'Cloudflare (домены + подсети)' ],
-	[ 'cloudfront',     'Amazon CloudFront (домены + подсети)' ],
-	[ 'hdrezka',        'HDRezka' ],
-	[ 'roblox',         'Roblox (домены + подсети)' ],
-	[ 'digitalocean',   'DigitalOcean (домены + подсети)' ],
-	[ 'hetzner',        'Hetzner (домены + подсети)' ],
-	[ 'ovh',            'OVH (домены + подсети)' ],
-	[ 'geoblock',       'Геоблок — сервисы, закрывшие доступ из РФ' ],
-	[ 'block',          'Заблокированные в РФ (категория)' ],
-	[ 'news',           'Новости' ],
-	[ 'anime',          'Аниме' ],
-	[ 'porn',           'Для взрослых' ],
-	[ 'hodca',          'HODCA' ]
-];
+function tunnels() { return awg.sections('tunnel'); }
 
-// Готовые списки, которые имеет смысл отправлять напрямую в режиме «Полный».
-// russia_inside сюда НЕ годится: это заблокированные в РФ сайты, им как раз нужен туннель.
-var BYPASS_COMMUNITY = [
-	[ 'lib4u_ru', 'Российские сервисы (lib4u/amnezia-tunneling-ru): ~2200 доменов — банки, Госуслуги, маркетплейсы, Яндекс, VK, СМИ; обновляется ежедневно' ],
-	[ 'russia_outside', 'Россия снаружи — российские сервисы, закрытые для зарубежных IP (Госуслуги, Озон, Яндекс-CDN и др.)' ]
-];
-
-var RE_SECTION = /^[A-Za-z][A-Za-z0-9_]{0,23}$/;
-var RE_IP4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
-
-function parseMark(v) {
-	v = String(v == null ? '' : v).trim();
-	var n = NaN;
-	if (/^0x[0-9a-f]{1,8}$/i.test(v)) n = parseInt(v, 16);
-	else if (/^[1-9][0-9]{0,9}$/.test(v)) n = parseInt(v, 10);
-	return (n > 0 && n <= 0xffffffff) ? n : NaN;
-}
-
-function otherTunnels(section_id) {
-	return uci.sections('awgsplit', 'tunnel').filter(function(s) {
-		return s['.name'] !== section_id;
-	});
-}
-
-function nextFree(key, parse, from, to) {
-	var used = {};
-	uci.sections('awgsplit', 'tunnel').forEach(function(s) { used[parse(s[key])] = true; });
-	for (var i = from; i <= to; i++)
-		if (!used[i]) return i;
-	return from;
-}
-
-function checkSectionName(section_id) {
-	return RE_SECTION.test(section_id) ? true :
-		'Имя секции «' + section_id + '» не подходит: латиница, цифры и _, с буквы, до 24 символов. Удалите и создайте заново.';
-}
-
-function normDomain(d) {
-	d = d.toLowerCase().replace(/^\*\./, '').replace(/^\.+/, '').replace(/\.+$/, '');
-	if (!d || d.length > 253 || /[^a-z0-9.-]/.test(d)) return null;
-	var labels = d.split('.');
-	for (var i = 0; i < labels.length; i++)
-		if (!labels[i].length || labels[i].length > 63 || /^-|-$/.test(labels[i])) return null;
-	return d;
-}
-
-function validCidr(value) {
-	if (!value) return true;
-	var p = String(value).split('/');
-	if (p.length > 2 || !RE_IP4.test(p[0])) return 'Нужен IPv4-адрес или подсеть';
-	if (p.length === 2 && !(/^\d{1,2}$/.test(p[1]) && +p[1] <= 32)) return 'Маска подсети 0..32';
-	return true;
-}
-
-function validDomains(section_id, value) {
-	var bad = domainTokens(value).filter(function(t) { return normDomain(t) === null; });
-	if (bad.length)
-		return 'Некорректные записи: ' + bad.slice(0, 3).join(', ') +
-			(bad.length > 3 ? ' и ещё ' + (bad.length - 3) : '');
-	return true;
-}
-
-function domainTokens(text) {
+function groupsUsing(name) {
 	var out = [];
-	String(text || '').split(/\n/).forEach(function(line) {
-		line.replace(/#.*/, '').split(/[\s,;]+/).forEach(function(t) {
-			if (t) out.push(t);
-		});
+	awg.sections('group').forEach(function(g) {
+		var m = awg.list(g.tunnel), i = m.indexOf(name);
+		if (i >= 0) out.push({ group: g, index: i });
 	});
 	return out;
 }
 
-return view.extend({
+return view.extend(Object.assign({
 	load: function() {
 		return Promise.all([
-			callInterfaces().catch(function() { return []; }),
-			uci.load('awgsplit'),
-			uci.load('network')
+			awg.callInterfaces().catch(function() { return []; }),
+			awg.callStatus().catch(function() { return {}; }),
+			uci.load(CONF)
 		]);
 	},
 
 	render: function(data) {
-		var ifaces = Array.isArray(data[0]) ? data[0] : [];
-		var m, s, o;
+		var self = this;
+		this.ifaces = Array.isArray(data[0]) ? data[0] : [];
+		this.status = data[1] || {};
+		this.marker = awg.dirtyMarker();
+		this.listBox = E('div');
+		this.toolBox = E('div');
+		this.stateNodes = {};
 
-		m = new form.Map('awgsplit', 'Туннели и списки',
-			'Каждый туннель — отдельный интерфейс AmneziaWG со своей таблицей маршрутизации. ' +
-			'В режиме «Раздельный» домены и подсети из его списков идут в этот туннель, всё остальное — напрямую через провайдера. ' +
-			'В режиме «Полный» в туннель идёт всё, кроме исключений (раздел «Исключения» ниже). ' +
-			'Если адрес подходит нескольким туннелям, порядок такой: свои подсети → свои домены → ' +
-			'домены готовых списков → подсети готовых списков; на одном уровне побеждает туннель с меньшим приоритетом. ' +
-			'Более точный домен (api.example.com) всегда главнее общего (example.com).');
-
-		// ------------------------------------------------ общие настройки
-		s = m.section(form.NamedSection, 'global', 'awgsplit', 'Общие настройки');
-		s.anonymous = true;
-		s.addremove = false;
-
-		o = s.option(form.Flag, 'enabled', 'Включить awgsplit');
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'update_interval', 'Обновлять списки каждые (часов)');
-		o.datatype = 'range(1,720)';
-		o.default = '72';
-		o.placeholder = '72';
-
-		o = s.option(form.Flag, 'healthcheck', 'Следить за живостью туннелей',
-			'По времени последнего handshake. Если туннель упал — его трафик уходит в запасной туннель, а если запасного нет — напрямую.');
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'healthcheck_interval', 'Интервал проверки (сек)');
-		o.datatype = 'range(10,3600)';
-		o.default = '60';
-		o.placeholder = '60';
-
-		o = s.option(form.Flag, 'block_doh_canary', 'Не давать браузерам обходить DNS роутера',
-			'Выключает DNS-over-HTTPS в Firefox и iCloud Private Relay. Иначе их запросы идут мимо роутера и сайты не заворачиваются.');
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Flag, 'down_page', 'Показывать страницу «ВПН упал»',
-			'Когда туннель недоступен, роутер подменяет служебные проверки интернета Windows, Android и iOS — система сама открывает страницу. Один раз за разрыв.');
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'down_page_secs', 'Сколько держать страницу (сек)');
-		o.datatype = 'range(30,3600)';
-		o.default = '300';
-		o.placeholder = '300';
-		o.depends('down_page', '1');
-
-		o = s.option(form.DynamicList, 'lan_ifaces', 'Устройства LAN',
-			'Трафик с каких сетевых устройств заворачивать. Обычно это br-lan.');
-		o.placeholder = 'br-lan';
-		o.validate = function(section_id, value) {
-			if (!value) return true;
-			return /^[A-Za-z0-9_.-]{1,15}$/.test(value) ? true : 'Неверное имя устройства';
-		};
-
-		o = s.option(form.ListValue, 'mode', 'Режим работы',
-			'«Раздельный» — в туннель идёт только то, что есть в списках туннеля, остальное напрямую. ' +
-			'«Полный» — в туннель идёт всё, кроме исключений: российские сервисы (Яндекс, VK, MAX, Ozon, банки и т.д.) ' +
-			'остаются напрямую. В режиме «Полный» DNS по умолчанию тоже идёт внутри туннеля, а IPv6 вне исключений отключается ' +
-			'(клиенты сразу переходят на IPv4).');
-		o.value('split', 'Раздельный — в туннель только списки');
-		o.value('full', 'Полный — всё в туннель, кроме исключений');
-		o.default = 'split';
-		o.rmempty = false;
-
-		o = s.option(form.ListValue, 'full_tunnel', 'Туннель для всего остального',
-			'Куда уходит весь трафик, не попавший в исключения. Пусто — главный туннель по приоритету.');
-		o.depends('mode', 'full');
-		o.value('', '— главный по приоритету —');
-		uci.sections('awgsplit', 'tunnel', function(sc) {
-			o.value(sc['.name'], sc.label || sc['.name']);
-		});
-
-		o = s.option(form.Flag, 'full_killswitch', 'Kill switch для режима «Полный»',
-			'Если туннель упал, весь трафик, кроме исключений, сбрасывается, а не уходит напрямую через провайдера. ' +
-			'Исключения (российские сервисы) продолжают работать.');
-		o.depends('mode', 'full');
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.MultiValue, 'bypass_lists', 'Готовые списки-исключения',
-			'Идут напрямую в режиме «Полный». Не добавляйте сюда russia_inside — это заблокированные в РФ сайты, им нужен туннель.');
-		o.depends('mode', 'full');
-		BYPASS_COMMUNITY.forEach(function(c) { o.value(c[0], c[1]); });
-
-		o = s.option(form.DynamicList, 'bypass_subnets', 'Подсети-исключения',
-			'IPv4-адрес или подсеть, например 203.0.113.0/24 — идут напрямую в режиме «Полный».');
-		o.depends('mode', 'full');
-		o.validate = function(section_id, value) { return validCidr(value); };
-
-		o = s.option(form.ListValue, 'log_level', 'Подробность логов');
-		o.value('error', 'Только ошибки');
-		o.value('info', 'Обычная');
-		o.value('debug', 'Отладочная');
-		o.default = 'info';
-
-		// ------------------------------------------------ туннели
-		s = m.section(form.GridSection, 'tunnel', 'Туннели',
-			'Имя новой секции — латиница, цифры и _, с буквы (например second).');
-		s.addremove = true;
-		s.anonymous = false;
-		s.nodescriptions = true;
-		s.addbtntitle = 'Добавить туннель';
-
-		o = s.option(form.Flag, 'enabled', 'Вкл');
-		o.editable = true;
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'label', 'Название');
-		o.placeholder = 'Основной VPN';
-		o.editable = true;
-
-		o = s.option(form.ListValue, 'interface', 'Интерфейс',
-			'Интерфейс AmneziaWG. Создаётся на вкладке «Импорт конфига».');
-		var known = {};
-		ifaces.forEach(function(i) {
-			known[i.name] = true;
-			o.value(i.name, i.name + ' (' + i.proto + ')');
-		});
-		uci.sections('awgsplit', 'tunnel').forEach(function(sc) {
-			if (sc.interface && !known[sc.interface]) {
-				known[sc.interface] = true;
-				o.value(sc.interface, sc.interface + ' (ещё не создан)');
-			}
-		});
-		if (!ifaces.length)
-			o.value('', '— нет интерфейсов, сначала импортируйте .conf —');
-		o.rmempty = false;
-		o.validate = function(section_id, value) {
-			var r = checkSectionName(section_id);
-			if (r !== true) return r;
-			if (!value) return 'Выберите интерфейс';
-			var clash = otherTunnels(section_id).filter(function(t) { return t.interface === value; });
-			return clash.length ? 'Этот интерфейс уже занят туннелем «' + clash[0]['.name'] + '»' : true;
-		};
-
-		o = s.option(form.Value, 'fwmark', 'Метка пакетов',
-			'Уникальная для каждого туннеля, например 0x1001.');
-		o.modalonly = true;
-		o.rmempty = false;
-		o.default = '0x' + nextFree('fwmark', parseMark, 0x1001, 0x10ff).toString(16);
-		o.validate = function(section_id, value) {
-			var n = parseMark(value);
-			if (isNaN(n)) return 'Нужно число: 0x1..0xffffffff или десятичное без ведущих нулей';
-			var clash = otherTunnels(section_id).filter(function(t) { return parseMark(t.fwmark) === n; });
-			return clash.length ? 'Метка уже занята туннелем «' + clash[0]['.name'] + '»' : true;
-		};
-
-		o = s.option(form.Value, 'table', 'Таблица маршрутизации',
-			'Уникальный номер 1..252, например 101.');
-		o.modalonly = true;
-		o.rmempty = false;
-		o.datatype = 'range(1,252)';
-		o.default = String(nextFree('table', function(v) { return +v; }, 101, 252));
-		o.validate = function(section_id, value) {
-			if (!/^[1-9][0-9]{0,2}$/.test(String(value))) return 'Целое число 1..252 без ведущих нулей';
-			var clash = otherTunnels(section_id).filter(function(t) { return +t.table === +value; });
-			return clash.length ? 'Таблица уже занята туннелем «' + clash[0]['.name'] + '»' : true;
-		};
-
-		o = s.option(form.Value, 'priority', 'Приоритет',
-			'91..32765. Меньше — главнее, если адрес подходит двум туннелям.');
-		o.modalonly = true;
-		o.rmempty = false;
-		o.datatype = 'range(91,32765)';
-		o.default = String(nextFree('priority', function(v) { return +v; }, 101, 32765));
-		o.validate = function(section_id, value) {
-			return /^[1-9][0-9]{1,4}$/.test(String(value)) ? true : 'Целое число 91..32765 без ведущих нулей';
-		};
-
-		o = s.option(form.ListValue, 'fallback', 'Запасной туннель',
-			'Куда отправить трафик, если этот туннель упадёт.');
-		o.modalonly = true;
-		o.value('', '— напрямую через провайдера —');
-		uci.sections('awgsplit', 'tunnel', function(sc) {
-			o.value(sc['.name'], sc.label || sc['.name']);
-		});
-		o.validate = function(section_id, value) {
-			return value === section_id ? 'Туннель не может быть запасным сам для себя' : true;
-		};
-
-		o = s.option(form.DynamicList, 'dns', 'DNS туннеля',
-			'Через него резолвятся домены этого туннеля (запросы идут внутри туннеля, провайдер их не видит и не подменяет). ' +
-			'Если пусто — берётся DNS из импортированного .conf (у серверов Amnezia это 172.29.172.254).');
-		o.modalonly = true;
-		o.placeholder = '172.29.172.254';
-		o.validate = function(section_id, value) {
-			if (!value) return true;
-			return RE_IP4.test(value) ? true : 'Нужен IPv4-адрес';
-		};
-
-		o = s.option(form.MultiValue, 'community_lists', 'Готовые списки');
-		COMMUNITY.forEach(function(c) { o.value(c[0], c[1]); });
-		o.modalonly = true;
-		o.display_size = 12;
-
-		o = s.option(form.DynamicList, 'subnets', 'Свои подсети',
-			'IPv4-адрес или подсеть, например 203.0.113.0/24 — пойдут в туннель без участия DNS. Главнее всех остальных правил.');
-		o.modalonly = true;
-		o.validate = function(section_id, value) { return validCidr(value); };
-
-		// ------------------------------------------------ свои домены
-		s = m.section(form.GridSection, 'domains', 'Свои списки доменов',
-			'Один домен на строку (можно через пробел или запятую), # — комментарий. ' +
-			'Поддомены покрываются автоматически: example.com захватит и api.example.com.');
-		s.addremove = true;
-		s.anonymous = false;
-		s.nodescriptions = true;
-		s.addbtntitle = 'Добавить список';
-
-		o = s.option(form.Flag, 'enabled', 'Вкл');
-		o.editable = true;
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'label', 'Название списка');
-		o.placeholder = 'Мой список';
-		o.editable = true;
-
-		o = s.option(form.Flag, 'killswitch', 'Kill switch',
-			'Трафик этих доменов не пропускается мимо туннеля: если туннель недоступен, соединения сбрасываются, а не идут напрямую.');
-		o.editable = true;
-		o.default = '0';
-		o.rmempty = true;
-
-		o = s.option(form.ListValue, 'tunnel', 'В какой туннель');
-		o.value('', '— не назначен —');
-		var tunnelNames = {};
-		uci.sections('awgsplit', 'tunnel', function(sc) {
-			tunnelNames[sc['.name']] = true;
-			o.value(sc['.name'], sc.label || sc['.name']);
-		});
-		// список, привязанный к удалённому туннелю, показываем как есть — не подменяем молча первым туннелем
-		uci.sections('awgsplit', 'domains', function(sc) {
-			if (sc.tunnel && !tunnelNames[sc.tunnel]) {
-				tunnelNames[sc.tunnel] = true;
-				o.value(sc.tunnel, sc.tunnel + ' (туннель не найден)');
-			}
-		});
-		o.rmempty = false;
-		o.validate = function(section_id, value) {
-			return value ? true : 'Выберите туннель (сначала создайте его выше)';
-		};
-
-		o = s.option(form.TextValue, 'domains', 'Домены');
-		o.rows = 20;
-		o.wrap = 'off';
-		o.modalonly = true;
-		o.placeholder = 'example.com\nanother.org';
-		o.validate = validDomains;
-
-		o = s.option(form.DummyValue, '_count', 'Доменов');
-		o.cfgvalue = function(section_id) {
-			return String(domainTokens(uci.get('awgsplit', section_id, 'domains')).length);
-		};
-
-		// ------------------------------------------------ исключения (режим «Полный»)
-		s = m.section(form.GridSection, 'bypass', 'Исключения: идут напрямую (режим «Полный»)',
-			'В режиме «Полный» эти домены не заворачиваются в туннель и резолвятся через DNS провайдера. ' +
-			'Один домен на строку, # — комментарий; поддомены входят автоматически. Строка «ru» исключает всю зону .ru. ' +
-			'Заблокированные в РФ сайты из готовых списков туннеля (russia_inside) остаются в туннеле, даже если исключена вся зона. ' +
-			'В режиме «Раздельный» эти списки не используются.');
-		s.addremove = true;
-		s.anonymous = false;
-		s.nodescriptions = true;
-		s.addbtntitle = 'Добавить список исключений';
-
-		o = s.option(form.Flag, 'enabled', 'Вкл');
-		o.editable = true;
-		o.default = '1';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'label', 'Название списка');
-		o.placeholder = 'Российские сервисы';
-		o.editable = true;
-
-		o = s.option(form.TextValue, 'domains', 'Домены');
-		o.rows = 20;
-		o.wrap = 'off';
-		o.modalonly = true;
-		o.placeholder = 'yandex.ru\nvk.com';
-		o.validate = validDomains;
-
-		o = s.option(form.DummyValue, '_count', 'Доменов');
-		o.cfgvalue = function(section_id) {
-			return String(domainTokens(uci.get('awgsplit', section_id, 'domains')).length);
-		};
-
-		// ------------------------------------------------ памятка на странице
-		function li(parts) { return E('li', { 'style': 'margin:4px 0' }, parts); }
-		var guide = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, 'Как это устроено'),
-			E('p', {}, [
-				E('strong', {}, 'Раздельный режим: '),
-				'в туннель идёт только то, что есть в списках туннеля, всё остальное — напрямую через провайдера.'
-			]),
-			E('p', {}, [
-				E('strong', {}, 'Полный режим: '),
-				'в туннель идёт всё, кроме исключений. Решение для каждого нового соединения принимается по порядку, ' +
-				'первое совпадение побеждает:'
-			]),
-			E('ol', { 'style': 'margin-left:1.5em' }, [
-				li('Внутренние адреса (192.168.x.x, 10.x, 172.16–31.x и др.) — всегда напрямую. Роутер, ESP32, соседний ПК, ' +
-					'принтер и сеть за WAN доступны всегда.'),
-				li('Списки, закреплённые за туннелем (его «Готовые списки», «Свои подсети» и «Свои списки доменов» ниже) — ' +
-					'всегда через этот туннель, независимо от того, какой выбран «для всего остального».'),
-				li('Исключения (раздел «Исключения»: зона .ru, Яндекс, VK, MAX, AliExpress, банки, Госуслуги и т.д.) — ' +
-					'напрямую, мимо всех туннелей.'),
-				li('Всё остальное — через «Туннель для всего остального». Его можно переключать одним нажатием ' +
-					'на странице «Обзор».')
-			]),
-			E('p', {}, [
-				E('strong', {}, 'Kill switch: '),
-				'если туннель упал, трафик к нему не уходит напрямую, а блокируется (исключения продолжают работать). ' +
-				'Если у туннеля задан «Запасной туннель», трафик переходит на него вместо блокировки.'
-			]),
-			E('details', {}, [
-				E('summary', {}, 'Пример: США по умолчанию, Казахстан по переключателю, TikTok всегда через США'),
-				E('ol', { 'style': 'margin-left:1.5em' }, [
-					li('Вкладка «Импорт конфига»: загрузите .conf США с именем awg_main и .conf Казахстана с именем awg_second.'),
-					li('В таблице «Туннели»: у первого выберите интерфейс awg_main, у второго — awg_second и включите его (флажок «Вкл»). ' +
-						'У второго в «Запасной туннель» оставьте первый, если при падении Казахстана трафик должен идти через США; ' +
-						'очистите поле, если вместо этого он должен блокироваться.'),
-					li('Откройте первый туннель (кнопка «Изменить») и в «Готовые списки» отметьте TikTok — он закреплён за США.'),
-					li('В «Общие настройки» выберите режим «Полный», убедитесь, что флажок Kill switch включён, ' +
-						'и в «Туннель для всего остального» выберите первый туннель.'),
-					li('«Сохранить и применить». Дальше переключайтесь между США и Казахстаном на странице «Обзор»: TikTok ' +
-						'останется на США, .ru и внутренние адреса — напрямую.')
+		var root = awg.page('Туннели', 'Туннель — это одно подключение к VPN-серверу (интерфейс AmneziaWG). Сам по себе туннель ничего ' +
+			'не заворачивает: сайты направляются в группы (вкладка «Группы и списки»), а группа использует свои туннели по порядку.', [
+			awg.card('Как добавить VPN-сервер', [
+				E('ol', { 'class': 'awg-steps' }, [
+					E('li', {}, txt('Нажмите «Импортировать .conf…» и загрузите файл из приложения AmneziaVPN (Поделиться → формат AmneziaWG).')),
+					E('li', {}, txt('Туннель появится в списке ниже. Дайте ему понятное название, например «США #1».')),
+					E('li', {}, txt('Нажмите «Сохранить и применить» внизу страницы.')),
+					E('li', {}, txt('На вкладке «Группы и списки» добавьте туннель в группу — только тогда через него пойдут сайты.'))
 				])
-			])
+			]),
+			this.marker.node,
+			this.toolBox,
+			this.listBox
 		]);
 
-		return m.render().then(function(node) {
-			return E('div', {}, [ guide, node ]);
+		this.draw();
+		poll.add(function() {
+			return awg.callStatus().then(function(st) { if (st) { self.status = st; self.updateStates(); } }).catch(function() {});
+		}, 10);
+		return root;
+	},
+
+	changed: function() { this.marker.mark(); },
+
+	liveState: function(name) {
+		var list = Array.isArray(this.status.tunnels) ? this.status.tunnels : [];
+		return list.filter(function(t) { return t.name === name; })[0] || null;
+	},
+
+	stateContent: function(name) {
+		var enabled = uci.get(CONF, name, 'enabled') !== '0';
+		var t = this.liveState(name);
+		if (!enabled) return [ awg.tunnelBadge('off') ];
+		if (!t) return [ awg.badge('off', '○ Ещё не применён'), E('div', { 'class': 'awg-muted awg-small' },
+			txt('Состояние появится после «Сохранить и применить».')) ];
+		return [ awg.tunnelBadge(t.state), E('div', { 'class': 'awg-muted awg-small' }, txt(awg.fmtHandshake(t.handshake_age))) ];
+	},
+
+	updateStates: function() {
+		var self = this;
+		Object.keys(this.stateNodes).forEach(function(name) {
+			var node = self.stateNodes[name];
+			var t = self.liveState(name);
+			awg.patch(node, [ t && t.state, t && t.handshake_age, uci.get(CONF, name, 'enabled') ], function() { return self.stateContent(name); });
+		});
+	},
+
+	ifaceOptions: function(current) {
+		var opts = [ [ '', '— выберите интерфейс —' ] ], known = {};
+		this.ifaces.forEach(function(i) {
+			known[i.name] = true;
+			opts.push([ i.name, i.name + ' (' + (i.proto || '?') + ')' ]);
+		});
+		tunnels().forEach(function(t) {
+			if (t.interface && !known[t.interface]) {
+				known[t.interface] = true;
+				opts.push([ t.interface, t.interface + ' (интерфейса нет в сети — импортируйте .conf)' ]);
+			}
+		});
+		return opts;
+	},
+
+	freeIface: function() {
+		var used = {};
+		tunnels().forEach(function(t) { if (t.interface) used[t.interface] = true; });
+		var f = this.ifaces.filter(function(i) { return !used[i.name]; })[0];
+		return f ? f.name : '';
+	},
+
+	addTunnel: function(iface, label) {
+		if (tunnels().length >= awg.MAX_TUNNELS) return null;
+		var name = awg.uniqueName('tun');
+		uci.add(CONF, 'tunnel', name);
+		uci.set(CONF, name, 'enabled', '1');
+		if (label) uci.set(CONF, name, 'label', label);
+		if (iface) uci.set(CONF, name, 'interface', iface);
+		this.changed();
+		this.draw();
+		return name;
+	},
+
+	removeTunnel: function(name) {
+		var self = this;
+		var used = groupsUsing(name);
+		var label = awg.sectionLabel(uci.get(CONF, name));
+		ui.showModal('Удалить туннель «' + label + '»?', [
+			E('p', {}, txt('Из настроек awgsplit удалится только запись о туннеле. Сам интерфейс AmneziaWG в «Сеть → Интерфейсы» останется.')),
+			used.length ? awg.banner('warn', 'Туннель используется в группах',
+				'Он будет убран из групп: ' + used.map(function(u) { return '«' + awg.sectionLabel(u.group) + '»'; }).join(', ') +
+				'. Проверьте потом, что в каждой группе остался хотя бы один туннель.') : '',
+			E('div', { 'class': 'right awg-btns', 'style': 'justify-content:flex-end' }, [
+				E('button', { 'class': 'btn', 'type': 'button', 'click': ui.hideModal }, txt('Отмена')),
+				E('button', { 'class': 'btn cbi-button-negative', 'type': 'button', 'click': function() {
+					used.forEach(function(u) {
+						var gid = u.group['.name'];
+						awg.setOpt(gid, 'tunnel', awg.list(u.group.tunnel).filter(function(x) { return x !== name; }));
+						if (uci.get(CONF, gid, 'active') === name) uci.unset(CONF, gid, 'active');
+					});
+					uci.remove(CONF, name);
+					ui.hideModal();
+					self.changed();
+					self.draw();
+				} }, txt('Удалить'))
+			])
+		]);
+	},
+
+	tunnelPanel: function(s) {
+		var self = this, name = s['.name'];
+		var enabled = s.enabled !== '0';
+
+		var en = E('input', { 'type': 'checkbox', 'checked': enabled ? '' : null });
+		en.addEventListener('change', function() {
+			uci.set(CONF, name, 'enabled', en.checked ? '1' : '0');
+			self.changed();
+			self.updateStates();
+		});
+
+		var label = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': s.label || '', 'placeholder': 'например, США #1', 'maxlength': '40' });
+		var lErr = awg.bindField(this.checks, label, {
+			set: function(v) { awg.setOpt(name, 'label', v.trim()); self.changed(); }
+		});
+
+		var iface = awg.select(this.ifaceOptions(), s.interface || '');
+		var iErr = awg.bindField(this.checks, iface, {
+			name: 'Туннель «' + (s.label || name) + '»',
+			validate: function(v) {
+				if (!v) return 'Выберите интерфейс (сначала импортируйте .conf)';
+				var clash = tunnels().filter(function(t) { return t['.name'] !== name && t.interface === v; });
+				return clash.length ? 'Этот интерфейс уже занят туннелем «' + awg.sectionLabel(clash[0]) + '»' : true;
+			},
+			set: function(v) { awg.setOpt(name, 'interface', v); self.changed(); },
+			after: function() { awg.runChecks(self.checks); }
+		});
+
+		var dns = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': awg.list(s.dns).join(', '), 'placeholder': 'из .conf (обычно 172.29.172.254)' });
+		var dErr = awg.bindField(this.checks, dns, {
+			name: 'DNS туннеля «' + (s.label || name) + '»',
+			validate: awg.validIp4Text,
+			set: function(v) { awg.setOpt(name, 'dns', awg.splitTokens(v)); self.changed(); }
+		});
+
+		var stateNode = E('div');
+		this.stateNodes[name] = stateNode;
+		dom.content(stateNode, this.stateContent(name));
+
+		var used = groupsUsing(name);
+		var usage = used.length ?
+			E('div', { 'class': 'awg-small' }, [ E('strong', {}, txt('В группах: ')), E('span', {}, txt(used.map(function(u) {
+				return '«' + awg.sectionLabel(u.group) + '» (' + (u.index === 0 ? 'основной' : 'запасной ' + u.index) + ')';
+			}).join(', '))) ]) :
+			E('div', { 'class': 'awg-small' }, [ awg.badge('warn', '⚠ Не входит ни в одну группу'),
+				E('span', {}, txt(' — через него ничего не пойдёт. Добавьте его в группу на вкладке ')),
+				E('a', { 'href': L.url('admin/services/awgsplit/groups') }, txt('«Группы и списки»')) ]);
+
+		return E('div', { 'class': 'awg-panel ' + (enabled ? 'awg-s-info' : '') }, [
+			E('div', { 'class': 'awg-head' }, [
+				E('div', { 'class': 'awg-title' }, [
+					E('label', { 'class': 'awg-check' }, [ en, E('strong', {}, txt('Включён')) ]),
+					stateNode
+				]),
+				E('div', { 'class': 'awg-btns' }, [
+					E('span', { 'class': 'awg-muted awg-small' }, txt('id: ' + name)),
+					E('button', { 'class': 'btn cbi-button-negative', 'type': 'button', 'click': function() { self.removeTunnel(name); } }, txt('✕ Удалить'))
+				])
+			]),
+			E('div', { 'class': 'awg-fields' }, [
+				awg.field('Название', label, 'Как туннель будет называться в группах и на «Обзоре».', lErr),
+				awg.field('Интерфейс AmneziaWG', iface, 'Создаётся импортом .conf. У каждого туннеля свой.', iErr),
+				awg.field('DNS туннеля (необязательно)', dns,
+					'Через него внутри туннеля узнаются адреса сайтов группы. Пусто — берётся DNS из .conf.', dErr)
+			]),
+			usage
+		]);
+	},
+
+	draw: function() {
+		var self = this;
+		this.checks = [];
+		this.stateNodes = {};
+		var list = tunnels();
+		var full = list.length >= awg.MAX_TUNNELS;
+
+		dom.content(this.toolBox, E('div', { 'class': 'awg-row', 'style': 'margin-bottom:12px' }, [
+			awg.button('⇪ Импортировать .conf…', 'cbi-button-action', function() { self.importDialog(); }),
+			E('button', {
+				'type': 'button', 'class': 'btn cbi-button-add',
+				'disabled': full ? '' : null,
+				'title': full ? 'Не больше ' + awg.MAX_TUNNELS + ' туннелей' : null,
+				'click': function() { self.addTunnel(self.freeIface(), ''); }
+			}, txt('+ Добавить туннель вручную')),
+			E('span', { 'class': 'awg-count' }, txt('Туннелей: ' + list.length + ' из ' + awg.MAX_TUNNELS)),
+			full ? E('span', { 'class': 'awg-muted awg-small' }, txt('Достигнут максимум — удалите ненужный туннель, чтобы добавить новый.')) : ''
+		]));
+
+		dom.content(this.listBox, list.length ? list.map(function(s) { return self.tunnelPanel(s); }) :
+			[ awg.card(null, [ E('p', {}, txt('Туннелей пока нет. Нажмите «Импортировать .conf…» — это самый простой способ.')) ]) ]);
+		// ошибки показываем сразу, чтобы конфликт интерфейсов был виден при открытии страницы
+		awg.runChecks(this.checks);
+	},
+
+	extraChecks: function() {
+		var n = tunnels().length;
+		return n > awg.MAX_TUNNELS ? [ 'Туннелей ' + n + ', а можно не больше ' + awg.MAX_TUNNELS ] : [];
+	},
+
+	// ---------------------------------------------------------------- импорт .conf прямо отсюда
+	importDialog: function() {
+		var self = this;
+		var used = {};
+		this.ifaces.forEach(function(i) { used[i.name] = true; });
+		tunnels().forEach(function(t) { if (t.interface) used[t.interface] = true; });
+		var sug = 'awg_main';
+		for (var i = 1; used[sug]; i++) sug = 'awg_' + i;
+
+		var name = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': sug, 'maxlength': '15' });
+		var label = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': 'например, США #1', 'maxlength': '40' });
+		var conf = E('textarea', { 'class': 'cbi-input-textarea', 'rows': '12', 'wrap': 'off', 'spellcheck': 'false',
+			'placeholder': '[Interface]\nAddress = 10.8.0.2/32\nPrivateKey = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = 1.2.3.4:35574' });
+		var file = E('input', { 'type': 'file', 'accept': '.conf,.txt,text/plain' });
+		file.addEventListener('change', function() {
+			var f = file.files && file.files[0];
+			if (!f) return;
+			if (f.size > 65536) { awg.note('Файл слишком большой — это точно .conf?', 'danger'); return; }
+			var r = new FileReader();
+			r.onload = function() {
+				conf.value = String(r.result || '');
+				if (!label.value) label.value = f.name.replace(/\.[^.]*$/, '').slice(0, 40);
+			};
+			r.readAsText(f);
+		});
+
+		ui.showModal('Импорт конфига AmneziaVPN', [
+			awg.field('Файл .conf', file, 'Или вставьте текст файла целиком в поле ниже.'),
+			awg.field('Текст .conf', conf),
+			E('div', { 'class': 'awg-fields' }, [
+				awg.field('Название туннеля', label, 'Для вас: «США #1», «Казахстан».'),
+				awg.field('Имя интерфейса', name, 'Латиница, цифры и _, с буквы, до 15 символов. Повторный импорт с тем же именем обновит настройки.')
+			]),
+			awg.muted('Поддерживаются все поля AmneziaWG 1.x–3.x. Всё проверяется до записи — при ошибке настройки роутера не меняются. ' +
+				'AllowedIPs из файла не уводит весь трафик в туннель: маршрутами управляет awgsplit.'),
+			E('div', { 'class': 'awg-btns', 'style': 'justify-content:flex-end' }, [
+				E('button', { 'class': 'btn', 'type': 'button', 'click': ui.hideModal }, txt('Отмена')),
+				E('button', { 'class': 'btn cbi-button-action', 'type': 'button', 'click': ui.createHandlerFn(null, function() {
+					return self.doImport(name.value.trim(), conf.value, label.value.trim());
+				}) }, txt('Импортировать'))
+			])
+		]);
+	},
+
+	doImport: function(name, conf, label) {
+		var self = this;
+		if (!RE_IFACE.test(name) || RESERVED[name]) {
+			awg.note('Имя интерфейса: латиница, цифры и _, с буквы, до 15 символов, не lan/wan (например awg_main).', 'danger');
+			return;
+		}
+		if (!/\[Interface\]/i.test(conf) || !/\[Peer\]/i.test(conf)) {
+			awg.note('Нужен .conf целиком — с секциями [Interface] и [Peer].', 'danger');
+			return;
+		}
+		ui.showModal('Импорт', [ E('p', { 'class': 'spinning' }, txt('Разбираю конфиг и создаю интерфейс…')) ]);
+		return awg.callImport(conf, name).then(function(res) {
+			var ok = (res && res.code === 0);
+			return awg.callInterfaces().catch(function() { return self.ifaces; }).then(function(ifs) {
+				if (Array.isArray(ifs)) self.ifaces = ifs;
+				var added = null, existing = tunnels().filter(function(t) { return t.interface === name; })[0];
+				if (ok && !existing) added = self.addTunnel(name, label || name);
+				if (ok && existing && label && !existing.label) { uci.set(CONF, existing['.name'], 'label', label); self.changed(); }
+				self.draw();
+				ui.showModal(ok ? '✔ Готово' : 'Ошибка импорта', [
+					ok ? awg.banner('ok', added ? 'Туннель «' + (label || name) + '» добавлен в список' :
+						existing ? 'Интерфейс обновлён, туннель «' + awg.sectionLabel(existing) + '» уже есть' :
+						'Интерфейс создан, но туннелей уже ' + awg.MAX_TUNNELS + ' — новый не добавлен', [
+						E('span', {}, txt('Дальше: нажмите «Сохранить и применить» внизу страницы, затем добавьте туннель в группу на вкладке «Группы и списки».'))
+					]) : '',
+					E('pre', { 'class': 'awg-pre' }, txt(res && res.output ? res.output : 'Нет вывода')),
+					E('div', { 'class': 'awg-btns', 'style': 'justify-content:flex-end' }, [
+						E('button', { 'class': 'btn', 'type': 'button', 'click': ui.hideModal }, txt('Закрыть'))
+					])
+				]);
+			});
+		}).catch(function(e) {
+			ui.hideModal();
+			awg.rpcError(e);
 		});
 	}
-});
+}, awg.saveHandlers('draw')));

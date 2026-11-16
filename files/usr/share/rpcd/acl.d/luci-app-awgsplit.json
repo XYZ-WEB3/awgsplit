@@ -3,18 +3,40 @@
 		"description": "Доступ к awgsplit",
 		"read": {
 			"ubus": {
-				"luci.awgsplit": [ "status", "dump", "interfaces", "pages", "explain" ]
+				"luci.awgsplit": [
+					"status",
+					"dump",
+					"interfaces",
+					"pages",
+					"explain"
+				]
 			},
-			"uci": [ "awgsplit", "network" ]
+			"uci": [
+				"awgsplit",
+				"network"
+			]
 		},
 		"write": {
 			"ubus": {
-				"luci.awgsplit": [ "update", "restart", "import_conf", "set_default", "set_page", "upload_page" ]
+				"luci.awgsplit": [
+					"update",
+					"restart",
+					"import_conf",
+					"set_default",
+					"set_active",
+					"test_notify",
+					"set_page",
+					"upload_page"
+				]
 			},
 			"file": {
-				"/tmp/awgsplit-page.upload": [ "write" ]
+				"/tmp/awgsplit-page.upload": [
+					"write"
+				]
 			},
-			"uci": [ "awgsplit" ]
+			"uci": [
+				"awgsplit"
+			]
 		}
 	}
 }

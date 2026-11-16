@@ -30,7 +30,8 @@ start_service() {
 }
 
 stop_service() {
-	$BIN stop 1000>&-
+	# при restart вместо правил остаётся охрана kill switch (без окна, когда трафик идёт мимо туннеля)
+	if [ "$action" = restart ]; then $BIN stop guard 1000>&-; else $BIN stop 1000>&-; fi
 }
 
 reload_service() {

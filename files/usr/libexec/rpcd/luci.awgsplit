@@ -25,7 +25,9 @@ case "$1" in
   "restart": {},
   "dump": { "tunnel": "str" },
   "interfaces": {},
-  "set_default": { "mode": "str", "tunnel": "str" },
+  "set_default": { "mode": "str", "group": "str", "tunnel": "str" },
+  "set_active": { "group": "str", "tunnel": "str" },
+  "test_notify": {},
   "explain": { "target": "str" },
   "pages": {},
   "set_page": { "file": "str" },
@@ -52,23 +54,50 @@ EOF
 				reply result started
 			;;
 
-			# быстрое переключение со страницы «Обзор»: режим и/или туннель «для всего остального»
+			# быстрое переключение со страницы «Обзор»: режим и/или группа «для всего остального»
 			set_default)
 				read -r input
 				json_load "$input" 2>/dev/null
 				json_get_var mode mode
+				json_get_var group group
 				json_get_var tunnel tunnel
+				[ -n "$group" ] || group="$tunnel"   # старое имя параметра
 				case "$mode" in ''|split|full) ;; *) reply error "Неверный режим"; exit 0 ;; esac
-				if [ -n "$tunnel" ]; then
-					valid_name "$tunnel" 24 && [ "$(uci -q get awgsplit."$tunnel")" = tunnel ] \
-						|| { reply error "Туннель '$tunnel' не найден"; exit 0; }
-					uci -q set awgsplit.global.full_tunnel="$tunnel"
+				if [ -n "$group" ]; then
+					valid_name "$group" 24 && [ "$(uci -q get awgsplit."$group")" = group ] 						|| { reply error "Группа '$group' не найдена"; exit 0; }
+					uci -q set awgsplit.global.full_group="$group"
+					uci -q delete awgsplit.global.full_tunnel
 				fi
 				[ -n "$mode" ] && uci -q set awgsplit.global.mode="$mode"
 				uci -q commit awgsplit
 				# в фоне: применение пересобирает dnsmasq и может занять дольше таймаута LuCI
 				( $BIN start ) >/dev/null 2>&1 </dev/null &
 				reply result started
+			;;
+
+			# ручное переключение активного туннеля группы (пусто = автоматически по приоритету)
+			set_active)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var group group
+				json_get_var tunnel tunnel
+				valid_name "$group" 24 && [ "$(uci -q get awgsplit."$group")" = group ] 					|| { reply error "Группа не найдена"; exit 0; }
+				if [ -n "$tunnel" ]; then
+					valid_name "$tunnel" 24 && case " $(uci -q get awgsplit."$group".tunnel) " in *" $tunnel "*) true ;; *) false ;; esac 						|| { reply error "Этого туннеля нет в группе"; exit 0; }
+				fi
+				uci -q set awgsplit."$group".active="$tunnel"
+				uci -q commit awgsplit
+				( $BIN routes ) >/dev/null 2>&1 </dev/null &
+				reply result started
+			;;
+
+			# тестовое сообщение в Telegram по сохранённым настройкам
+			test_notify)
+				out=$($BIN notify-test 2>&1); rc=$?
+				json_init
+				if [ "$rc" = 0 ]; then json_add_boolean ok 1; else json_add_boolean ok 0; fi
+				json_add_string output "$out"
+				json_dump
 			;;
 
 			# страницы «ВПН упал»: встроенная и свои из /www/awgsplit-pages/. Выбранная — это uhttpd.main.error_page

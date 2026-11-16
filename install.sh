@@ -135,14 +135,17 @@ put() { # mode src dst — атомарно, без утилиты install (её
 
 put 0755 files/usr/bin/awgsplit                  /usr/bin/awgsplit
 put 0755 files/etc/init.d/awgsplit               /etc/init.d/awgsplit
+put 0755 files/etc/init.d/awgsplit-guard         /etc/init.d/awgsplit-guard
+put 0755 files/usr/share/awgsplit/fw4-include.sh /usr/share/awgsplit/fw4-include.sh
 put 0755 files/usr/share/awgsplit/import-awg.sh  /usr/share/awgsplit/import-awg.sh
 put 0644 files/usr/share/awgsplit/bypass-ru.lst  /usr/share/awgsplit/bypass-ru.lst
+put 0644 files/usr/share/awgsplit/notify.sh       /usr/share/awgsplit/notify.sh
 # ключ подписи пакета: после него обновления ставятся из LuCI по ссылке на .apk
 put 0644 files/etc/apk/keys/awgsplit.rsa.pub     /etc/apk/keys/awgsplit.rsa.pub
 put 0755 files/usr/libexec/rpcd/luci.awgsplit    /usr/libexec/rpcd/luci.awgsplit
 put 0644 files/usr/share/rpcd/acl.d/luci-app-awgsplit.json /usr/share/rpcd/acl.d/luci-app-awgsplit.json
 put 0644 files/usr/share/luci/menu.d/luci-app-awgsplit.json /usr/share/luci/menu.d/luci-app-awgsplit.json
-for f in overview tunnels import diag; do
+for f in common overview tunnels groups telegram settings import diag; do
 	put 0644 "files/www/luci-static/resources/view/awgsplit/$f.js" "/www/luci-static/resources/view/awgsplit/$f.js"
 done
 # страница «Барахлит ВПН, он упал» и её публичная «живость туннелей» (JSON без секретов)
@@ -177,6 +180,9 @@ if [ -z "$(uci -q get awgsplit.ru_services)" ] && [ -s /usr/share/awgsplit/bypas
 		&& uci -q commit awgsplit \
 		&& ok "Добавлен список исключений «Российские сервисы» (используется в режиме «Полный»)"
 fi
+
+# схема настроек v2 (группы туннелей): старые настройки переводятся один раз, копия — /etc/awgsplit-v1-config.bak
+/usr/bin/awgsplit migrate >/dev/null 2>&1
 
 # Исключения режима «Полный»: добавляем готовые списки один раз (метка bypass_defaults), чтобы после очистки
 # списка пользователем они не возвращались. Скачиваются при запуске службы.
@@ -228,6 +234,10 @@ else
 		warn "Убрал из dnsmasq остатки Podkop (сервер 127.0.0.42), копия dhcp в $BK"
 	fi
 	/etc/init.d/awgsplit enable && ok "Автозапуск включён"
+	/etc/init.d/awgsplit-guard enable >/dev/null 2>&1
+	if [ "$(uci -q get firewall.awgsplit)" != include ]; then
+		uci -q set firewall.awgsplit=include && uci -q set firewall.awgsplit.type='script' 			&& uci -q set firewall.awgsplit.path='/usr/share/awgsplit/fw4-include.sh' 			&& uci -q set firewall.awgsplit.fw4_compatible='1' && uci -q commit firewall
+	fi
 	# stop при первой установке ругается «service not found» — это нормально, прячем
 	/etc/init.d/awgsplit stop >/dev/null 2>&1
 	/etc/init.d/awgsplit start && ok "awgsplit запущен"

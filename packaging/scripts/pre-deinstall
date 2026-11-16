@@ -4,4 +4,10 @@ if [ -x /etc/init.d/awgsplit ]; then
 	/etc/init.d/awgsplit stop >/dev/null 2>&1
 	/etc/init.d/awgsplit disable >/dev/null 2>&1
 fi
+if [ -x /etc/init.d/awgsplit-guard ]; then
+	/etc/init.d/awgsplit-guard disable >/dev/null 2>&1
+fi
+if [ "$(uci -q get firewall.awgsplit)" = include ]; then
+	uci -q delete firewall.awgsplit && uci -q commit firewall
+fi
 exit 0

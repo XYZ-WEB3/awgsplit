@@ -4,7 +4,7 @@
 #   /src  — репозиторий (только чтение)     /out — куда положить пакет
 #   /key  — каталог с закрытым ключом awgsplit.rsa (если есть — пакет подписывается)
 set -e
-VERSION="${AWGSPLIT_VERSION:-1.2.1}"
+VERSION="${AWGSPLIT_VERSION:-2.0.0}"
 apk add -q apk-tools >/dev/null
 
 S=/tmp/stage
@@ -23,7 +23,7 @@ find "$S" -type f | while read -r f; do
 done
 find "$S" -type d -exec chmod 755 {} +
 find "$S" -type f -exec chmod 644 {} +
-chmod 755 "$S/usr/bin/awgsplit" "$S/etc/init.d/awgsplit" "$S/usr/share/awgsplit/import-awg.sh" \
+chmod 755 "$S/usr/bin/awgsplit" "$S/etc/init.d/awgsplit" "$S/etc/init.d/awgsplit-guard" "$S/usr/share/awgsplit/import-awg.sh" "$S/usr/share/awgsplit/fw4-include.sh" \
 	"$S/usr/libexec/rpcd/luci.awgsplit" "$S/www/cgi-bin/awgsplit-state"
 
 mkdir -p /out

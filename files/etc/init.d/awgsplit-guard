@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# awgsplit: охрана kill switch на время загрузки.
+# Ставится ДО сети (network = 20, firewall = 19) в собственную таблицу inet awgsplit; fw4 чужие таблицы
+# при старте не трогает. Снимается атомарно первым же «awgsplit start» (S94). Ничего не делает, если
+# служба awgsplit отключена, выключена в настройках или нет ни одной группы; блокирует только транзит
+# LAN -> наружу (forward), доступ к самому роутеру остаётся всегда.
+
+START=18
+
+boot() {
+	/etc/init.d/awgsplit enabled || return 0
+	/usr/bin/awgsplit guard
+}
+
+start() { :; }
+stop() { :; }

@@ -1,6 +1,8 @@
 #!/bin/sh
-# Публичный (без входа) JSON о живости туннелей — для страницы /awgsplit-down.html.
+# Публичный (без входа) JSON о живости туннелей — для страницы «ВПН упал» (/awgsplit-down.html и своих страниц).
 # Отдаёт только имена, статус и возраст рукопожатия; ни ключей, ни адресов здесь нет.
+# Элемент массива tunnels — это ГРУППА туннелей: active — какой туннель сейчас работает, route —
+# tunnel | fallback:<имя> | direct (ни один туннель группы не работает), state — связь активного туннеля.
 
 D=/var/run/awgsplit
 
@@ -15,17 +17,21 @@ esc() { printf '%s' "$1" | tr -d '\000-\037"\\'; }
 
 overall=up
 out=""
-for h in "$D"/*.health; do
-	[ -f "$h" ] || continue
-	t=${h##*/}; t=${t%.health}
-	st=$(cat "$h" 2>/dev/null)
-	rt=$(cat "$D/$t.route" 2>/dev/null)
-	age=$(cat "$D/$t.hsage" 2>/dev/null)
+for r in "$D"/*.route; do
+	[ -f "$r" ] || continue
+	g=${r##*/}; g=${g%.route}
+	rt=$(cat "$r" 2>/dev/null)
+	act=$(cat "$D/$g.active" 2>/dev/null)
+	st=down; age=-1
+	if [ -n "$act" ]; then
+		st=$(cat "$D/tn.$act.health" 2>/dev/null)
+		age=$(cat "$D/tn.$act.hsage" 2>/dev/null)
+	fi
 	case "$age" in -1|[0-9]*) ;; *) age=-1 ;; esac
-	label=$(uci -q get awgsplit."$t".label)
-	# «упал» = трафик туннеля идёт напрямую (запасной туннель тоже считается живым)
+	label=$(uci -q get awgsplit."$g".label)
+	# «упал» = ни один туннель группы не работает, её трафик идёт напрямую или заблокирован
 	case "$rt" in direct) overall=down ;; esac
-	out="$out${out:+,}{\"name\":\"$(esc "$t")\",\"label\":\"$(esc "${label:-$t}")\",\"state\":\"$(esc "$st")\",\"route\":\"$(esc "$rt")\",\"hsage\":${age:--1}}"
+	out="$out${out:+,}{\"name\":\"$(esc "$g")\",\"label\":\"$(esc "${label:-$g}")\",\"active\":\"$(esc "$act")\",\"state\":\"$(esc "$st")\",\"route\":\"$(esc "$rt")\",\"hsage\":${age:--1}}"
 done
 
 printf '{"state":"%s","tunnels":[%s]}\n' "$overall" "$out"

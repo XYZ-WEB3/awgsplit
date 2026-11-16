@@ -18,6 +18,9 @@ if [ -z "$(uci -q get awgsplit.ru_services)" ] && [ -s "$BYP" ]; then
 		&& echo "awgsplit: добавлен список исключений «Российские сервисы» (режим «Полный»)"
 fi
 
+# схема настроек v2 (группы туннелей): старые настройки переводятся один раз, копия — /etc/awgsplit-v1-config.bak
+/usr/bin/awgsplit migrate >/dev/null 2>&1
+
 # Исключения режима «Полный»: добавляем готовые списки один раз (метка bypass_defaults), чтобы после очистки
 # списка пользователем они не возвращались. Скачиваются при запуске службы.
 if [ "$(uci -q get awgsplit.global.bypass_defaults)" != 1 ]; then
@@ -25,6 +28,12 @@ if [ "$(uci -q get awgsplit.global.bypass_defaults)" != 1 ]; then
 		uci -q get awgsplit.global.bypass_lists | tr ' ' '\n' | grep -qx "$l" || uci -q add_list awgsplit.global.bypass_lists="$l"
 	done
 	uci -q set awgsplit.global.bypass_defaults=1 && uci -q commit awgsplit
+fi
+
+# охрана kill switch на время загрузки и после перезапуска firewall (fw4 include)
+/etc/init.d/awgsplit-guard enable >/dev/null 2>&1
+if [ "$(uci -q get firewall.awgsplit)" != include ]; then
+	uci -q set firewall.awgsplit=include 		&& uci -q set firewall.awgsplit.type='script' 		&& uci -q set firewall.awgsplit.path='/usr/share/awgsplit/fw4-include.sh' 		&& uci -q set firewall.awgsplit.fw4_compatible='1' 		&& uci -q commit firewall
 fi
 
 # настройки переживут sysupgrade (сами файлы после прошивки надо будет поставить заново)
