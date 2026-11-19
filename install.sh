@@ -41,17 +41,8 @@ PODKOP=0
 if [ -x /etc/init.d/podkop ] && /etc/init.d/podkop enabled 2>/dev/null; then PODKOP=1; fi
 nft list table inet PodkopTable >/dev/null 2>&1 && PODKOP=1
 
-# ---------------------------------------------------------------- зависимости
-CF=/etc/apk/repositories.d/customfeeds.list
-FEED="https://2grey.github.io/awg-openwrt/${DISTRIB_RELEASE}/${DISTRIB_TARGET}/packages.adb"
 
 if [ "$NODEPS" = 0 ]; then
-	# после sysupgrade в фиде 2Grey остаётся старая версия OpenWrt — apk update на ней падает
-	if [ -f "$CF" ] && grep -q '2grey\.github\.io/awg-openwrt' "$CF" && ! grep -qxF "$FEED" "$CF"; then
-		sed -i '\#2grey\.github\.io/awg-openwrt#d' "$CF"
-		echo "$FEED" >> "$CF"
-		ok "Фид AmneziaWG переключён на $DISTRIB_RELEASE"
-	fi
 
 	step "dnsmasq-full"
 	if has_nftset; then
@@ -98,31 +89,61 @@ if [ "$NODEPS" = 0 ]; then
 	else warn "Не смог поставить conntrack — не страшно, при переключении туннеля соединения переподключатся чуть дольше"; fi
 
 	step "AmneziaWG"
-	if [ -f /lib/netifd/proto/amneziawg.sh ] && [ -x /usr/bin/awg ]; then
-		ok "AmneziaWG уже установлен ($(apk list -I amneziawg-tools 2>/dev/null | cut -d' ' -f1))"
-	elif [ -f /lib/netifd/proto/amneziawg3.sh ]; then
-		ok "Найден amneziawg3 — буду использовать его"
-	else
-		warn "Ставлю AmneziaWG из фида 2Grey/awg-openwrt"
-		mkdir -p /etc/apk/keys /etc/apk/repositories.d
-		if wget -q -O /etc/apk/keys/awg-openwrt-feed.pem https://2grey.github.io/awg-openwrt/keys/awg-openwrt-feed.pem; then
-			grep -qxF "$FEED" "$CF" 2>/dev/null || echo "$FEED" >> "$CF"
-			apk update >/dev/null 2>&1
-			apk add kmod-amneziawg amneziawg-tools luci-proto-amneziawg > /tmp/awgsplit-awg.log 2>&1
-			tail -5 /tmp/awgsplit-awg.log
-			if pkg_installed kmod-amneziawg && pkg_installed amneziawg-tools; then
-				apk add luci-i18n-amneziawg-ru >/dev/null 2>&1
-				ok "AmneziaWG установлен"
-				warn "После установки нужна перезагрузка роутера, чтобы сеть узнала новый протокол"
-				NEED_REBOOT=1
-			else
-				warn "Не получилось поставить AmneziaWG (нет пакетов под $DISTRIB_RELEASE/$DISTRIB_TARGET?)"
-				warn "Инструкция: https://github.com/2Grey/awg-openwrt"
-			fi
+	
+	ask_yn() {
+    # $1 — текст вопроса
+    printf "%s [y/n]: " "$1"
+    while true; do
+        read answer
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Оо][Нн]?) return 1 ;;
+            *) printf "Ответьте y или n: " ;;
+        esac
+    done
+	}
+		
+	if ask_yn "Установить AmneziaWG? "; then
+	
+		# ---------------------------------------------------------------- зависимости
+		CF=/etc/apk/repositories.d/customfeeds.list
+		FEED="https://2grey.github.io/awg-openwrt/${DISTRIB_RELEASE}/${DISTRIB_TARGET}/packages.adb"
+		# после sysupgrade в фиде 2Grey остаётся старая версия OpenWrt — apk update на ней падает
+		if [ -f "$CF" ] && grep -q '2grey\.github\.io/awg-openwrt' "$CF" && ! grep -qxF "$FEED" "$CF"; then
+			sed -i '\#2grey\.github\.io/awg-openwrt#d' "$CF"
+			echo "$FEED" >> "$CF"
+			ok "Фид AmneziaWG переключён на $DISTRIB_RELEASE"
+		fi
+	
+		if [ -f /lib/netifd/proto/amneziawg.sh ] && [ -x /usr/bin/awg ]; then
+			ok "AmneziaWG уже установлен ($(apk list -I amneziawg-tools 2>/dev/null | cut -d' ' -f1))"
+		elif [ -f /lib/netifd/proto/amneziawg3.sh ]; then
+			ok "Найден amneziawg3 — буду использовать его"
+		else
+			warn "Ставлю AmneziaWG из фида 2Grey/awg-openwrt"
+			mkdir -p /etc/apk/keys /etc/apk/repositories.d
+			if wget -q -O /etc/apk/keys/awg-openwrt-feed.pem https://2grey.github.io/awg-openwrt/keys/awg-openwrt-feed.pem; then
+				grep -qxF "$FEED" "$CF" 2>/dev/null || echo "$FEED" >> "$CF"
+				apk update >/dev/null 2>&1
+				apk add kmod-amneziawg amneziawg-tools luci-proto-amneziawg > /tmp/awgsplit-awg.log 2>&1
+				tail -5 /tmp/awgsplit-awg.log
+				if pkg_installed kmod-amneziawg && pkg_installed amneziawg-tools; then
+					apk add luci-i18n-amneziawg-ru >/dev/null 2>&1
+					ok "AmneziaWG установлен"
+					warn "После установки нужна перезагрузка роутера, чтобы сеть узнала новый протокол"
+					NEED_REBOOT=1
+				else
+					warn "Не получилось поставить AmneziaWG (нет пакетов под $DISTRIB_RELEASE/$DISTRIB_TARGET?)"
+					warn "Инструкция: https://github.com/2Grey/awg-openwrt"
+				fi
 		else
 			warn "Не скачался ключ фида 2Grey — проверьте интернет. Инструкция: https://github.com/2Grey/awg-openwrt"
 		fi
+		fi
+		
 	fi
+    echo "без AmneziaWG"
+    
 fi
 
 # ---------------------------------------------------------------- файлы
